@@ -1,0 +1,46 @@
+{
+  "name": "captcha-hub",
+  "productName": "Captcha Hub",
+  "version": "1.0.0",
+  "description": "验证码收件箱 (Captcha Hub) — 把你自己拥有的短信/邮箱/TOTP 验证码汇聚到一个桌面界面",
+  "author": "Captcha Hub Team",
+  "license": "MIT",
+  "private": true,
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "build:win": "npm run build && electron-builder --win",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "electron-store": "^8.2.0",
+    "imapflow": "^1.0.164",
+    "mailparser": "^3.7.1",
+    "otplib": "^12.0.1"
+  },
+  "devDependencies": {
+    "@emotion/react": "^11.13.0",
+    "@emotion/styled": "^11.13.0",
+    "@mui/icons-material": "^5.16.7",
+    "@mui/material": "^5.16.7",
+    "@types/mailparser": "^3.4.4",
+    "@types/node": "^20.14.15",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.20",
+    "electron": "^30.5.1",
+    "electron-builder": "^24.13.3",
+    "postcss": "^8.4.41",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwindcss": "^3.4.10",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.2",
+    "vite-plugin-electron": "^0.28.7",
+    "vitest": "^2.0.5"
+  }
+}

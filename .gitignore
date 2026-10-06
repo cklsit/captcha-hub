@@ -1,0 +1,16 @@
+# 工作目录元数据（不入库）
+.workbuddy/
+.vscode/
+.idea/
+
+# 依赖与构建产物
+node_modules/
+dist/
+dist-electron/
+release/
+coverage/
+
+# 日志与系统文件
+*.log
+.DS_Store
+Thumbs.db

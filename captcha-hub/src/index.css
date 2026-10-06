@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  font-family:
+    'Segoe UI', 'Microsoft YaHei', system-ui, -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+}
+
+/* Slim, theme-aware scrollbars for the desktop feel. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.6);
+  background-clip: content-box;
+}
+
+/* Monospace styling for verification codes. */
+.code-font {
+  font-family: 'Cascadia Mono', 'Consolas', 'SFMono-Regular', 'Menlo', monospace;
+  letter-spacing: 0.14em;
+}
+
+/* Prevent accidental text selection flicker while dragging, but keep copyable text selectable. */
+.no-select {
+  user-select: none;
+}
