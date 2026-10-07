@@ -17,9 +17,39 @@ export interface RawMail {
   date: Date;
 }
 
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
+interface ImapErrorDetails {
+  message?: string;
+  responseText?: string;
+  serverResponseCode?: string;
+  authenticationFailed?: boolean;
+}
+
+/**
+ * imapflow surfaces most server-side rejections as the unhelpful
+ * `Error: Command failed`; the real reason lives in `responseText` /
+ * `serverResponseCode`. Unwrap those and attach an actionable hint for the
+ * mistakes users actually make — chiefly using a web login password where the
+ * provider requires an app-specific authorisation code.
+ */
+export function describeImapError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const details = error as Error & ImapErrorDetails;
+
+  const code = details.serverResponseCode?.trim();
+  const responseText = details.responseText?.trim();
+  const raw = details.message?.trim() || 'IMAP 操作失败';
+
+  if (details.authenticationFailed || code === 'AUTHENTICATIONFAILED') {
+    return '认证失败：邮箱地址或密码不正确。网易 163/126、QQ 等邮箱必须填写「授权码」——需先在邮箱网页端的设置里开启 IMAP 服务并生成授权码，不能使用网页登录密码。';
+  }
+
+  const detail = [code, responseText].filter(Boolean).join(' — ');
+
+  if (/unsafe login/i.test(detail)) {
+    return `服务器拒绝了本次登录（Unsafe Login）。请确认已在邮箱设置中开启 IMAP 服务。原始信息：${detail}`;
+  }
+
+  return detail ? `${raw}（${detail}）` : raw;
 }
 
 function addressToText(address: ParsedMail['from']): string {
@@ -48,6 +78,18 @@ function htmlToText(html: string | Buffer | undefined): string {
     .trim();
 }
 
+/**
+ * Netease (163 / 126 / yeah.net) enforces the RFC 2971 `ID` command: a client
+ * that never announces itself gets `SELECT Unsafe Login` and every mailbox
+ * operation after login fails. imapflow sends ID automatically once
+ * `clientInfo` is set, which is why this cannot be omitted.
+ */
+const CLIENT_INFO = {
+  name: 'Captcha Hub',
+  version: '1.0.0',
+  vendor: 'Captcha Hub',
+};
+
 function createClient(credentials: EmailCredentials): ImapFlow {
   return new ImapFlow({
     host: credentials.host,
@@ -57,6 +99,7 @@ function createClient(credentials: EmailCredentials): ImapFlow {
       user: credentials.username,
       pass: credentials.password,
     },
+    clientInfo: CLIENT_INFO,
     // ImapFlow's logger is intentionally disabled to keep the console clean.
     logger: false,
   });
@@ -84,7 +127,7 @@ export async function testImapConnection(
     } catch {
       /* ignore secondary failure */
     }
-    return { ok: false, message: errorMessage(error) };
+    return { ok: false, message: describeImapError(error) };
   }
 }
 

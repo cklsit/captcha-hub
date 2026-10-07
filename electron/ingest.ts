@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { fetchRecentMails } from './imap';
+import { fetchRecentMails, describeImapError } from './imap';
 import { extractCode, resolveSourceForMail } from './extractor';
 import { broadcast } from './events';
 import * as store from './store';
@@ -82,7 +82,7 @@ export async function syncSource(source: Source): Promise<SourceSyncResult> {
     }
     return { sourceId: source.id, sourceName: source.name, added: addedCount, error: null };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = describeImapError(error);
     store.setSourceSyncResult(source.id, 'error', message, Date.now());
     return { sourceId: source.id, sourceName: source.name, added: 0, error: message };
   }

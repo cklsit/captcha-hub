@@ -334,6 +334,7 @@ export function SourceForm({
                 type="password"
                 value={email.password}
                 onChange={(event) => setEmail({ ...email, password: event.target.value })}
+                helperText="网易 163/126、QQ 邮箱必须先开启 IMAP 服务并生成「授权码」，此处填授权码，不是网页登录密码。"
                 fullWidth
               />
               <TextField
