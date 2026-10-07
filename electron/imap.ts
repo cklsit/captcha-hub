@@ -79,16 +79,53 @@ function htmlToText(html: string | Buffer | undefined): string {
 }
 
 /**
- * Netease (163 / 126 / yeah.net) enforces the RFC 2971 `ID` command: a client
- * that never announces itself gets `SELECT Unsafe Login` and every mailbox
- * operation after login fails. imapflow sends ID automatically once
- * `clientInfo` is set, which is why this cannot be omitted.
+ * Identity we announce through the RFC 2971 `ID` command. imapflow already
+ * sends a default clientInfo before LOGIN; overriding it only replaces the
+ * advertised name, which is why this alone does NOT fix Netease (see below).
  */
 const CLIENT_INFO = {
   name: 'Captcha Hub',
   version: '1.0.0',
   vendor: 'Captcha Hub',
 };
+
+/** 163 / 126 / yeah.net — the providers that gate SELECT behind the ID command. */
+const NETEASE_HOST = /(^|\.)(163\.com|126\.com|yeah\.net)$/i;
+
+/**
+ * Netease only allows `SELECT` once the client has announced itself with the
+ * `ID` command *in the authenticated state*; otherwise it answers
+ * `NO SELECT Unsafe Login. Please contact kefu@188.com for help`.
+ *
+ * imapflow sends ID before LOGIN and then re-sends it only when the server's
+ * pre-auth reply carried fewer than two keys (`startSession()` checks
+ * `Object.keys(idRequested).length < 2`). Netease answers with three
+ * (`name`, `vendor`, `transid`), so the re-send never happens and every
+ * mailbox operation after login fails — which is exactly why the app reported
+ * the opaque `Command failed`.
+ *
+ * Re-announcing after login closes that gap. `run()` is imapflow's internal
+ * command dispatcher and is absent from its public typings, so it is probed
+ * defensively and every failure is swallowed: for every other provider the ID
+ * command is purely advisory and must never break the connection.
+ */
+export async function announceClientId(client: ImapFlow, host: string): Promise<void> {
+  if (!NETEASE_HOST.test(host)) return;
+
+  const internal = client as unknown as {
+    run?: (command: string, ...args: unknown[]) => Promise<unknown>;
+    capabilities?: Map<string, unknown> | Set<string>;
+  };
+
+  if (typeof internal.run !== 'function') return;
+  if (internal.capabilities && !internal.capabilities.has('ID')) return;
+
+  try {
+    await internal.run('ID', CLIENT_INFO);
+  } catch {
+    /* advisory command — never fail a connection because of it */
+  }
+}
 
 function createClient(credentials: EmailCredentials): ImapFlow {
   return new ImapFlow({
@@ -112,6 +149,7 @@ export async function testImapConnection(
   const client = createClient(credentials);
   try {
     await client.connect();
+    await announceClientId(client, credentials.host);
     const mailbox = credentials.mailbox || 'INBOX';
     const lock = await client.getMailboxLock(mailbox);
     try {
@@ -142,6 +180,7 @@ export async function fetchRecentMails(
   const client = createClient(credentials);
   const mails: RawMail[] = [];
   await client.connect();
+  await announceClientId(client, credentials.host);
   const mailbox = credentials.mailbox || 'INBOX';
   const lock = await client.getMailboxLock(mailbox);
   try {
