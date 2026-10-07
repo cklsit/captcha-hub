@@ -109,6 +109,7 @@ export function SourceForm({
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
   const [scanResult, setScanResult] = useState<TotpScanResult | null>(null);
+  const [presetNote, setPresetNote] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [testing, setTesting] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -121,6 +122,7 @@ export function SourceForm({
     setError(null);
     setTestResult(null);
     setScanResult(null);
+    setPresetNote(null);
     if (initial) {
       setKind(initial.kind);
       setName(initial.name);
@@ -251,6 +253,9 @@ export function SourceForm({
       port: preset.port,
       secure: preset.secure,
     }));
+    // Preset notes carry provider-specific setup steps (authorisation codes,
+    // OAuth-only providers…), so surface them instead of leaving them unused.
+    setPresetNote(preset.note);
   }
 
   /**
@@ -344,6 +349,7 @@ export function SourceForm({
                     />
                   ))}
                 </Box>
+                {presetNote ? <Alert severity="info">{presetNote}</Alert> : null}
               </Box>
               <Box sx={{ display: 'flex', gap: 2 }}>
                 <TextField

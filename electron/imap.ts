@@ -25,25 +25,58 @@ interface ImapErrorDetails {
 }
 
 /**
+ * Hosts where no password can ever work.
+ *
+ * Microsoft retired Basic Authentication for Outlook.com / Hotmail / Live /
+ * MSN and for Exchange Online. The server is explicit about it — CAPABILITY
+ * advertises `LOGINDISABLED` with `AUTH=XOAUTH2` as the only mechanism, and a
+ * LOGIN attempt answers `NO Basic authentication is disabled.` Both the web
+ * password and app passwords are rejected. (Verified against the live server,
+ * not inferred from documentation.)
+ */
+const OAUTH_ONLY_HOST = /(^|\.)(outlook\.com|hotmail\.com|live\.com|msn\.com|office365\.com)$/i;
+
+/** True when the provider only accepts OAuth 2.0, so a password is futile. */
+export function isOAuthOnlyHost(host: string): boolean {
+  return OAUTH_ONLY_HOST.test(host.trim());
+}
+
+const MICROSOFT_OAUTH_HINT =
+  'Microsoft 账户无法用密码登录 IMAP：微软已停用基本验证（服务器返回 LOGINDISABLED，只接受 AUTH=XOAUTH2），' +
+  '网页密码与应用密码都会被拒绝，只能使用 OAuth 2.0。' +
+  '可行做法：在 Outlook 网页版「设置 → 邮件 → 转发」把邮件转发到另一个支持 IMAP 的邮箱（例如你已配置好的 163），再把那个邮箱添加为来源。';
+
+/**
  * imapflow surfaces most server-side rejections as the unhelpful
  * `Error: Command failed`; the real reason lives in `responseText` /
  * `serverResponseCode`. Unwrap those and attach an actionable hint for the
  * mistakes users actually make — chiefly using a web login password where the
  * provider requires an app-specific authorisation code.
+ *
+ * @param host IMAP host of the source being tested or synced. Needed to tell
+ *   "your password is wrong" apart from "this provider no longer accepts
+ *   passwords at all" — two problems with completely different fixes.
  */
-export function describeImapError(error: unknown): string {
+export function describeImapError(error: unknown, host = ''): string {
   if (!(error instanceof Error)) return String(error);
   const details = error as Error & ImapErrorDetails;
 
   const code = details.serverResponseCode?.trim();
   const responseText = details.responseText?.trim();
   const raw = details.message?.trim() || 'IMAP 操作失败';
+  const detail = [code, responseText].filter(Boolean).join(' — ');
+
+  // On an OAuth-only host every LOGIN attempt fails regardless of whether the
+  // credentials are correct, so reporting "密码不正确" would send the user
+  // chasing a problem they cannot fix.
+  const basicAuthBlocked =
+    details.authenticationFailed === true ||
+    /basic authentication is disabled|LOGINDISABLED|login is disabled/i.test(`${raw} ${detail}`);
+  if (isOAuthOnlyHost(host) && basicAuthBlocked) return MICROSOFT_OAUTH_HINT;
 
   if (details.authenticationFailed || code === 'AUTHENTICATIONFAILED') {
     return '认证失败：邮箱地址或密码不正确。网易 163/126、QQ 等邮箱必须填写「授权码」——需先在邮箱网页端的设置里开启 IMAP 服务并生成授权码，不能使用网页登录密码。';
   }
-
-  const detail = [code, responseText].filter(Boolean).join(' — ');
 
   if (/unsafe login/i.test(detail)) {
     return `服务器拒绝了本次登录（Unsafe Login）。请确认已在邮箱设置中开启 IMAP 服务。原始信息：${detail}`;
@@ -165,7 +198,7 @@ export async function testImapConnection(
     } catch {
       /* ignore secondary failure */
     }
-    return { ok: false, message: describeImapError(error) };
+    return { ok: false, message: describeImapError(error, credentials.host) };
   }
 }
 

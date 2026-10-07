@@ -90,7 +90,7 @@ export async function syncSource(source: Source): Promise<SourceSyncResult> {
     }
     return { sourceId: source.id, sourceName: source.name, added: addedCount, error: null };
   } catch (error) {
-    const message = describeImapError(error);
+    const message = describeImapError(error, source.email?.host ?? '');
     store.setSourceSyncResult(source.id, 'error', message, Date.now());
     return { sourceId: source.id, sourceName: source.name, added: 0, error: message };
   }

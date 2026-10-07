@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { announceClientId, describeImapError } from '../electron/imap';
+import { announceClientId, describeImapError, isOAuthOnlyHost } from '../electron/imap';
 import type { ImapFlow } from 'imapflow';
 
 /**
@@ -113,5 +113,84 @@ describe('describeImapError', () => {
 
   it('没有任何附加信息的普通错误原样返回', () => {
     expect(describeImapError(imapError('ETIMEDOUT'))).toBe('ETIMEDOUT');
+  });
+});
+
+/**
+ * Microsoft retired Basic Authentication for IMAP: the server advertises
+ * `LOGINDISABLED` with `AUTH=XOAUTH2` as the only mechanism and answers LOGIN
+ * with `NO Basic authentication is disabled.` Reporting "密码不正确" there sends
+ * the user chasing a problem they cannot fix, so the host decides the message.
+ */
+describe('describeImapError：只接受 OAuth 的 Microsoft 主机', () => {
+  it('认证失败时解释为「该服务商已不接受密码」，而不是「密码不正确」', () => {
+    const result = describeImapError(
+      imapError('Command failed', { authenticationFailed: true }),
+      'outlook.office365.com',
+    );
+    expect(result).toContain('OAuth');
+    expect(result).toContain('转发');
+    expect(result).not.toContain('密码不正确');
+  });
+
+  it('服务器明说 Basic authentication is disabled 时同样识别（即使没标记 authenticationFailed）', () => {
+    const result = describeImapError(
+      imapError('Command failed', { responseText: 'Basic authentication is disabled.' }),
+      'outlook.office365.com',
+    );
+    expect(result).toContain('OAuth');
+  });
+
+  it('识别 imapflow 对 LOGINDISABLED 的实际措辞「Login is disabled」', () => {
+    // 实测 imapflow 连 Outlook 时抛出的就是这句，且 responseText 为空。
+    const result = describeImapError(imapError('Login is disabled'), 'outlook.office365.com');
+    expect(result).toContain('OAuth');
+  });
+
+  it('同一个错误换到网易主机上，仍然给出授权码提示', () => {
+    const result = describeImapError(
+      imapError('Command failed', { authenticationFailed: true }),
+      'imap.163.com',
+    );
+    expect(result).toContain('授权码');
+    expect(result).not.toContain('OAuth');
+  });
+
+  it('Microsoft 主机上的网络类错误不会被误报成 OAuth 问题', () => {
+    expect(describeImapError(imapError('ETIMEDOUT'), 'outlook.office365.com')).toBe('ETIMEDOUT');
+  });
+
+  it('省略 host 时保持原有行为（向后兼容）', () => {
+    const result = describeImapError(imapError('Command failed', { authenticationFailed: true }));
+    expect(result).toContain('授权码');
+  });
+});
+
+describe('isOAuthOnlyHost', () => {
+  it('覆盖 Microsoft 全部消费级 IMAP 主机', () => {
+    for (const host of [
+      'outlook.office365.com',
+      'imap-mail.outlook.com',
+      'outlook.com',
+      'hotmail.com',
+      'live.com',
+      'msn.com',
+      '  Outlook.Office365.com  ',
+    ]) {
+      expect(isOAuthOnlyHost(host), host).toBe(true);
+    }
+  });
+
+  it('不误伤其他服务商与形似域名', () => {
+    for (const host of [
+      'imap.163.com',
+      'imap.qq.com',
+      'imap.gmail.com',
+      'outlook.com.evil.com',
+      'myoutlook.com',
+      'notoffice365.com',
+    ]) {
+      expect(isOAuthOnlyHost(host), host).toBe(false);
+    }
   });
 });
