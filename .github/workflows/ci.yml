@@ -1,0 +1,45 @@
+name: CI
+
+# 提交到主干、PR、或手动触发时，做「类型检查 + 构建 + 单元测试」三道关卡
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 同一分支的重复触发只保留最新一次，省额度
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: 类型检查 · 构建 · 测试
+    runs-on: ubuntu-latest
+    env:
+      # CI 只做编译与单测，用不到 Electron 原生二进制，跳过下载可显著加速
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖（严格按锁文件）
+        run: npm ci
+
+      - name: 类型检查
+        run: npm run typecheck
+
+      - name: 构建（渲染层 + 主进程 + preload）
+        run: npm run build
+
+      - name: 单元测试
+        run: npm test

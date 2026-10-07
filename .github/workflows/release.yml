@@ -1,0 +1,45 @@
+name: Build Windows Installer
+
+# 打 v* 标签时自动出包，也可在 Actions 页面手动触发
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: 打包 Windows 安装程序（NSIS）
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装依赖（严格按锁文件）
+        run: npm ci
+
+      - name: 类型检查 · 构建
+        run: npm run build
+
+      - name: 打包 NSIS 安装程序
+        run: npx electron-builder --win --publish never
+
+      - name: 上传安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: captcha-hub-windows
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/latest.yml
+          if-no-files-found: error
+          retention-days: 30
