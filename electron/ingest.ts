@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { fetchRecentMails, describeImapError } from './imap';
+import { ensureFreshCredentials } from './mail-auth';
 import { extractCode, isIngestible, resolveSourceForMail } from './extractor';
 import { broadcast } from './events';
 import * as store from './store';
@@ -41,7 +42,10 @@ export async function syncSource(source: Source): Promise<SourceSyncResult> {
   }
 
   try {
-    const mails = await fetchRecentMails(source.email, FETCH_LIMIT);
+    // OAuth sources transparently refresh their access token here; password
+    // sources come back untouched.
+    const credentials = await ensureFreshCredentials(source);
+    const mails = await fetchRecentMails(credentials, FETCH_LIMIT);
     const allSources = store.getSources();
     const collected: CaptchaMessage[] = [];
 

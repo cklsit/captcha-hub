@@ -44,7 +44,9 @@ Windows 桌面设备**没有蜂窝射频，无法直接接收短信**。因此�
 - 主进程 `contextIsolation: true`、`nodeIntegration: false`；渲染进程只能通过 `preload` 的
   `contextBridge` 暴露的**受控 API** 访问能力。
 - **TOTP 验证码在主进程生成**，渲染进程只拿到“当前验证码 + 剩余秒数”，永远接触不到明文密钥。
-- 邮箱授权码、TOTP 密钥在落盘前加密（`safeStorage` 优先，AES-256-GCM 兜底）。
+- 邮箱授权码、TOTP 密钥、OAuth 令牌在落盘前加密（`safeStorage` 优先，AES-256-GCM 兜底）。
+- Microsoft 账户走 OAuth 2.0 设备码流程：访问/刷新令牌**只存在于主进程**，从不经过
+  渲染层，界面只会显示设备码与状态。
 - 界面不回显密钥/密码；编辑来源时密码留空表示不修改。
 - 所有数据保存在本机，不上传任何服务器。
 
@@ -107,6 +109,9 @@ npm test
 
 1. **来源管理**：邮箱（IMAP，含 QQ/163/Gmail/Outlook 预设）、手机号（映射到邮箱转发规则）、
    TOTP 验证器；支持启用/停用、编辑、删除、测试连接。
+   邮箱支持两种认证方式：**密码 / 授权码**，以及 **Microsoft 账户 OAuth 2.0 登录**
+   （Outlook / Hotmail / Microsoft 365 —— 微软已停用 IMAP 密码登录，只能走 OAuth，
+   见 [`docs/microsoft-oauth-setup.md`](docs/microsoft-oauth-setup.md)）。
 2. **采集/同步**：IMAP 定时轮询（默认 60s，可配置 15s–10min）+ 手动“立即同步”；
    邮件解析 → 提取验证码 → 去重（来源 + UID）→ 归属到对应来源。
 3. **统一收件箱**：时间线卡片、来源色标、验证码大字一键复制、置信度、有效期提示；
@@ -129,5 +134,9 @@ npm test
 
 - 未实现 Android/iOS 采集端（按要求忽略）。
 - 邮箱密码不做备份导出（恢复后需重新填写），仅 TOTP 密钥可选明文导出。
+- **Microsoft 账户必须走 OAuth**：微软自 2022 年起停用了 IMAP 基本验证，
+  服务器直接返回 `LOGINDISABLED`，网页密码与应用密码均不可用。使用前需先注册一个
+  免费 Azure 应用，步骤见 [`docs/microsoft-oauth-setup.md`](docs/microsoft-oauth-setup.md)。
+  刷新令牌不随备份导出，恢复备份后需重新授权一次。
 - IMAP 收取为“拉取最近 N 封”策略，去重依赖 UID；若邮件在服务端被移动/删除，历史记录仍保留在本地。
 - 提取引擎为启发式实现，覆盖主流短信/邮件模板，不保证 100% 准确。

@@ -161,14 +161,18 @@ export async function announceClientId(client: ImapFlow, host: string): Promise<
 }
 
 function createClient(credentials: EmailCredentials): ImapFlow {
+  // imapflow switches to XOAUTH2 as soon as an access token is supplied — this
+  // is the only mechanism Microsoft still accepts for IMAP.
+  const auth =
+    credentials.authType === 'oauth2'
+      ? { user: credentials.username, accessToken: credentials.accessToken }
+      : { user: credentials.username, pass: credentials.password };
+
   return new ImapFlow({
     host: credentials.host,
     port: credentials.port,
     secure: credentials.secure,
-    auth: {
-      user: credentials.username,
-      pass: credentials.password,
-    },
+    auth,
     clientInfo: CLIENT_INFO,
     // ImapFlow's logger is intentionally disabled to keep the console clean.
     logger: false,

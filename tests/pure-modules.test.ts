@@ -24,6 +24,7 @@ const PURE_ENTRY_POINTS = [
   'electron/extractor.ts',
   'electron/qr.ts',
   'electron/otpauth.ts',
+  'electron/ms-oauth.ts',
   'electron/dedupe.ts',
   'electron/totp.ts',
   'electron/imap.ts',

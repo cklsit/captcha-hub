@@ -2,11 +2,13 @@ import Store from 'electron-store';
 import { randomUUID } from 'node:crypto';
 import { decryptString, encryptString } from './crypto';
 import { capMessages, mergeMessages, sortByReceivedDesc } from './dedupe';
+import { getPendingTokens, MS_DEFAULT_TENANT } from './ms-oauth';
 import { withTotpDefaults } from './totp';
 import type {
   AppSettings,
   BackupBundle,
   CaptchaMessage,
+  EmailAuthType,
   MessageFilter,
   SafeEmailCredentials,
   SafeSource,
@@ -66,10 +68,17 @@ function safeDecrypt(value: string): string {
   return decryptString(value);
 }
 
+/**
+ * Secrets are encrypted field by field. OAuth tokens matter as much as
+ * passwords here: a refresh token is a durable, revocable key to the mailbox,
+ * so it must never sit in the JSON file in the clear.
+ */
 function encryptSource(source: Source): Source {
   const next = clone(source);
-  if (next.email && next.email.password) {
-    next.email.password = encryptString(next.email.password);
+  if (next.email) {
+    if (next.email.password) next.email.password = encryptString(next.email.password);
+    if (next.email.refreshToken) next.email.refreshToken = encryptString(next.email.refreshToken);
+    if (next.email.accessToken) next.email.accessToken = encryptString(next.email.accessToken);
   }
   if (next.totp && next.totp.secret) {
     next.totp.secret = encryptString(next.totp.secret);
@@ -79,8 +88,10 @@ function encryptSource(source: Source): Source {
 
 function decryptSource(source: Source): Source {
   const next = clone(source);
-  if (next.email && next.email.password) {
-    next.email.password = safeDecrypt(next.email.password);
+  if (next.email) {
+    if (next.email.password) next.email.password = safeDecrypt(next.email.password);
+    if (next.email.refreshToken) next.email.refreshToken = safeDecrypt(next.email.refreshToken);
+    if (next.email.accessToken) next.email.accessToken = safeDecrypt(next.email.accessToken);
   }
   if (next.totp && next.totp.secret) {
     next.totp.secret = safeDecrypt(next.totp.secret);
@@ -91,8 +102,12 @@ function decryptSource(source: Source): Source {
 function toSafeSource(source: Source): SafeSource {
   let email: SafeEmailCredentials | null = null;
   if (source.email) {
-    const { password, ...rest } = source.email;
-    email = { ...rest, hasPassword: Boolean(password) };
+    const { password, refreshToken, accessToken, ...rest } = source.email;
+    email = {
+      ...rest,
+      hasPassword: Boolean(password),
+      hasRefreshToken: Boolean(refreshToken),
+    };
   }
   let totp: SafeTotpSecret | null = null;
   if (source.totp) {
@@ -158,15 +173,34 @@ function buildSource(input: SourceInput, existing?: Source): Source {
   base.updatedAt = now;
 
   if (input.kind === 'email') {
-    const previousPassword = existing?.email?.password ?? '';
-    const password = input.email?.password ? input.email.password : previousPassword;
+    const previous = existing?.email;
+    const authType: EmailAuthType = input.email?.authType ?? previous?.authType ?? 'password';
+    const keepTokens = authType === 'oauth2';
+
+    // Freshly minted tokens (from a just-finished device-code login) replace
+    // whatever is stored; otherwise the existing ones are kept so that merely
+    // editing a source never silently signs the user out.
+    const flow = input.email?.oauthFlowId ? getPendingTokens(input.email.oauthFlowId) : null;
+    if (keepTokens && !flow && !previous?.refreshToken) {
+      throw new Error('请先完成 Microsoft 账户登录，再保存该来源。');
+    }
+
     base.email = {
-      host: input.email?.host ?? existing?.email?.host ?? '',
-      port: input.email?.port ?? existing?.email?.port ?? 993,
-      secure: input.email?.secure ?? existing?.email?.secure ?? true,
-      username: input.email?.username ?? existing?.email?.username ?? '',
-      password,
-      mailbox: input.email?.mailbox || existing?.email?.mailbox || 'INBOX',
+      host: input.email?.host ?? previous?.host ?? '',
+      port: input.email?.port ?? previous?.port ?? 993,
+      secure: input.email?.secure ?? previous?.secure ?? true,
+      username: input.email?.username ?? previous?.username ?? '',
+      password: input.email?.password ? input.email.password : (previous?.password ?? ''),
+      mailbox: input.email?.mailbox || previous?.mailbox || 'INBOX',
+      authType,
+      clientId: input.email?.clientId?.trim() ?? previous?.clientId ?? '',
+      tenant: input.email?.tenant?.trim() || previous?.tenant || MS_DEFAULT_TENANT,
+      // Switching a source back to password auth drops the tokens: keeping a
+      // live mailbox key around that the user has just stopped using is a
+      // liability, not a convenience.
+      refreshToken: keepTokens ? flow?.refreshToken || previous?.refreshToken || '' : '',
+      accessToken: keepTokens ? flow?.accessToken || '' : '',
+      accessTokenExpiresAt: keepTokens ? (flow?.expiresAt ?? 0) : 0,
     };
     base.phone = null;
     base.totp = null;
@@ -247,6 +281,30 @@ export function setSourceSyncResult(
   sources[index].lastSyncStatus = status;
   sources[index].lastSyncError = error;
   sources[index] = encryptSource(sources[index]);
+  store().set('sources', sources);
+}
+
+/**
+ * Persists refreshed OAuth tokens onto an existing source.
+ *
+ * Called just before a mailbox connection when the cached access token is
+ * about to expire. Tokens go through the same encryption path as passwords —
+ * a refresh token is a durable key to the user's mailbox.
+ */
+export function updateEmailTokens(
+  id: string,
+  tokens: { accessToken: string; refreshToken: string; expiresAt: number },
+): void {
+  const sources = getSources();
+  const index = sources.findIndex((source) => source.id === id);
+  const target = index === -1 ? null : sources[index];
+  if (!target || !target.email) return;
+
+  target.email.accessToken = tokens.accessToken;
+  if (tokens.refreshToken) target.email.refreshToken = tokens.refreshToken;
+  target.email.accessTokenExpiresAt = tokens.expiresAt;
+
+  sources[index] = encryptSource(target);
   store().set('sources', sources);
 }
 
@@ -401,6 +459,14 @@ export function importBackup(bundle: BackupBundle): void {
             username: safe.email.username,
             password: '',
             mailbox: safe.email.mailbox,
+            authType: safe.email.authType ?? 'password',
+            clientId: safe.email.clientId ?? '',
+            tenant: safe.email.tenant ?? MS_DEFAULT_TENANT,
+            // Tokens are never exported, so a restored OAuth source must be
+            // re-authorised once before it can sync again.
+            refreshToken: '',
+            accessToken: '',
+            accessTokenExpiresAt: 0,
           }
         : null,
       phone: safe.phone ?? null,

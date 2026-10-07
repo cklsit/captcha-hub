@@ -5,7 +5,10 @@ import type {
   CaptchaHubApi,
   CaptchaMessage,
   ConnectionTestResult,
+  EmailSourceInput,
   MessageFilter,
+  MsLoginPollResult,
+  MsLoginStartResult,
   SafeSource,
   SourceInput,
   SourcePreset,
@@ -42,6 +45,12 @@ const api: CaptchaHubApi = {
       ipcRenderer.invoke('sources:toggle', id, enabled),
     test: (input: SourceInput): Promise<ConnectionTestResult> =>
       ipcRenderer.invoke('sources:test', input),
+    msLoginStart: (email: EmailSourceInput): Promise<MsLoginStartResult> =>
+      ipcRenderer.invoke('sources:msLoginStart', email),
+    msLoginPoll: (flowId: string): Promise<MsLoginPollResult> =>
+      ipcRenderer.invoke('sources:msLoginPoll', flowId),
+    msLoginCancel: (flowId: string): Promise<void> =>
+      ipcRenderer.invoke('sources:msLoginCancel', flowId),
   },
   messages: {
     list: (filter?: MessageFilter): Promise<CaptchaMessage[]> =>
@@ -83,6 +92,8 @@ const api: CaptchaHubApi = {
       ipcRenderer.invoke('system:saveText', defaultName, content),
     openTextFile: (): Promise<{ canceled: boolean; content?: string; path?: string }> =>
       ipcRenderer.invoke('system:openText'),
+    openExternal: (url: string): Promise<boolean> =>
+      ipcRenderer.invoke('system:openExternal', url),
     platform: process.platform,
     appVersion: process.env.npm_package_version ?? '1.0.0',
   },

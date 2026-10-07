@@ -1,10 +1,12 @@
-import { clipboard, dialog, ipcMain, nativeImage, type NativeImage } from 'electron';
+import { clipboard, dialog, ipcMain, nativeImage, shell, type NativeImage } from 'electron';
 import { readFile, writeFile } from 'node:fs/promises';
 import * as store from './store';
 import { SOURCE_PRESETS } from './presets';
 import { testImapConnection } from './imap';
+import { ensureFreshCredentials } from './mail-auth';
 import { generateTotp } from './totp';
 import { parseOtpAuthUri } from './otpauth';
+import { cancelLogin, MS_DEFAULT_TENANT, pollLogin, requestDeviceCode } from './ms-oauth';
 import { bgraToRgba, decodeQrPixels } from './qr';
 import { getSyncStatus, syncAll } from './ingest';
 import { restartScheduler } from './scheduler';
@@ -15,7 +17,10 @@ import type {
   CaptchaMessage,
   ConnectionTestResult,
   EmailCredentials,
+  EmailSourceInput,
   MessageFilter,
+  MsLoginPollResult,
+  MsLoginStartResult,
   SafeSource,
   SourceInput,
   SourcePreset,
@@ -56,7 +61,28 @@ async function testSource(input: SourceInput): Promise<ConnectionTestResult> {
     return { ok: false, message: '只有“邮箱来源”支持连接测试。' };
   }
 
-  // When editing an existing source the password field may be left blank; fall
+  const authType = input.email?.authType ?? 'password';
+
+  // An existing OAuth source is tested with its stored, silently refreshed
+  // tokens: the form cannot carry them, and there is no password to type.
+  if (authType === 'oauth2' && input.id) {
+    const stored = store.getSource(input.id);
+    if (!stored?.email) return { ok: false, message: '来源不存在。' };
+    try {
+      return await testImapConnection(await ensureFreshCredentials(stored));
+    } catch (error) {
+      return { ok: false, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  if (authType === 'oauth2') {
+    return {
+      ok: false,
+      message: '请先点击「使用 Microsoft 账户登录」完成授权并保存，之后即可测试连接。',
+    };
+  }
+
+  // When editing a password source the password field may be left blank; fall
   // back to the stored (encrypted) credential so the test still works.
   let password = input.email?.password ?? '';
   if (!password && input.id) {
@@ -70,6 +96,12 @@ async function testSource(input: SourceInput): Promise<ConnectionTestResult> {
     username: input.email?.username ?? '',
     password,
     mailbox: input.email?.mailbox || 'INBOX',
+    authType,
+    clientId: input.email?.clientId ?? '',
+    tenant: input.email?.tenant ?? MS_DEFAULT_TENANT,
+    refreshToken: '',
+    accessToken: '',
+    accessTokenExpiresAt: 0,
   };
 
   if (!credentials.host || !credentials.username || !credentials.password) {
@@ -199,6 +231,18 @@ export function registerIpc(): void {
   ipcMain.handle('sources:test', (_event, input: SourceInput): Promise<ConnectionTestResult> =>
     testSource(input),
   );
+  ipcMain.handle(
+    'sources:msLoginStart',
+    (_event, email: EmailSourceInput): Promise<MsLoginStartResult> =>
+      requestDeviceCode(email.clientId ?? '', email.tenant ?? MS_DEFAULT_TENANT),
+  );
+  ipcMain.handle(
+    'sources:msLoginPoll',
+    (_event, flowId: string): Promise<MsLoginPollResult> => pollLogin(flowId),
+  );
+  ipcMain.handle('sources:msLoginCancel', (_event, flowId: string): void => {
+    cancelLogin(flowId);
+  });
 
   // --- messages ------------------------------------------------------------
   ipcMain.handle('messages:list', (_event, filter?: MessageFilter): CaptchaMessage[] =>
@@ -272,4 +316,11 @@ export function registerIpc(): void {
       return { canceled: false, content, path: result.filePaths[0] };
     },
   );
+  ipcMain.handle('system:openExternal', async (_event, url: string): Promise<boolean> => {
+    // Only https: the renderer can be influenced by scanned QR payloads and the
+    // OAuth flow, neither of which should ever reach file:// or a custom scheme.
+    if (!/^https:\/\//i.test(url)) return false;
+    await shell.openExternal(url);
+    return true;
+  });
 }

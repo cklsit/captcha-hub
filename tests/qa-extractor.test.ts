@@ -126,6 +126,12 @@ describe('QA resolveSourceForMail — attribution rules', () => {
       username: 'me@example.com',
       password: 'secret',
       mailbox: 'INBOX',
+      authType: 'password',
+      clientId: '',
+      tenant: 'common',
+      refreshToken: '',
+      accessToken: '',
+      accessTokenExpiresAt: 0,
     },
   });
 

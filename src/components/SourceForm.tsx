@@ -15,10 +15,14 @@ import Switch from '@mui/material/Switch';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import ContentPasteOutlinedIcon from '@mui/icons-material/ContentPasteOutlined';
+import LoginOutlinedIcon from '@mui/icons-material/LoginOutlined';
+import OpenInNewOutlinedIcon from '@mui/icons-material/OpenInNewOutlined';
 import QrCodeScannerOutlinedIcon from '@mui/icons-material/QrCodeScannerOutlined';
 import type {
   ConnectionTestResult,
+  EmailAuthType,
   MatchField,
+  MsLoginStatus,
   SafeSource,
   SourceInput,
   SourceKind,
@@ -45,6 +49,9 @@ interface EmailFormState {
   username: string;
   password: string;
   mailbox: string;
+  authType: EmailAuthType;
+  clientId: string;
+  tenant: string;
 }
 
 interface PhoneFormState {
@@ -71,7 +78,20 @@ const EMPTY_EMAIL: EmailFormState = {
   username: '',
   password: '',
   mailbox: 'INBOX',
+  authType: 'password',
+  clientId: '',
+  tenant: 'common',
 };
+
+/** Live state of a Microsoft device-code login while the dialog is open. */
+interface OAuthFlowState {
+  flowId: string;
+  userCode: string;
+  verificationUri: string;
+  intervalSec: number;
+  status: MsLoginStatus;
+  message: string;
+}
 
 const EMPTY_PHONE: PhoneFormState = {
   phoneNumber: '',
@@ -110,6 +130,9 @@ export function SourceForm({
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
   const [scanResult, setScanResult] = useState<TotpScanResult | null>(null);
   const [presetNote, setPresetNote] = useState<string | null>(null);
+  const [oauthFlow, setOauthFlow] = useState<OAuthFlowState | null>(null);
+  const [oauthBusy, setOauthBusy] = useState(false);
+  const [oauthError, setOauthError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
   const [testing, setTesting] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -123,6 +146,8 @@ export function SourceForm({
     setTestResult(null);
     setScanResult(null);
     setPresetNote(null);
+    setOauthError(null);
+    setOauthFlow(null);
     if (initial) {
       setKind(initial.kind);
       setName(initial.name);
@@ -136,6 +161,9 @@ export function SourceForm({
               username: initial.email.username,
               password: '',
               mailbox: initial.email.mailbox,
+              authType: initial.email.authType ?? 'password',
+              clientId: initial.email.clientId ?? '',
+              tenant: initial.email.tenant ?? 'common',
             }
           : EMPTY_EMAIL,
       );
@@ -177,7 +205,12 @@ export function SourceForm({
     if (initial) input.id = initial.id;
 
     if (kind === 'email') {
-      input.email = { ...email };
+      input.email = {
+        ...email,
+        // Hand the main process a handle to the tokens it is holding for us;
+        // they never travel through the renderer.
+        ...(oauthFlow?.status === 'success' ? { oauthFlowId: oauthFlow.flowId } : {}),
+      };
     } else if (kind === 'phone') {
       input.phone = {
         phoneNumber: phone.phoneNumber.trim(),
@@ -198,7 +231,16 @@ export function SourceForm({
     if (kind === 'email') {
       if (!email.host) return '请填写 IMAP 服务器地址。';
       if (!email.username) return '请填写登录用户名（通常是邮箱地址）。';
-      if (!email.password && !initial?.email?.hasPassword) return '请填写邮箱授权码 / 密码。';
+      if (email.authType === 'oauth2') {
+        if (!email.clientId.trim()) return '请填写 Application (client) ID。';
+        const alreadyAuthorised = Boolean(initial?.email?.hasRefreshToken);
+        const justAuthorised = oauthFlow?.status === 'success';
+        if (!alreadyAuthorised && !justAuthorised) {
+          return '请先点击「使用 Microsoft 账户登录」并完成浏览器中的授权。';
+        }
+      } else if (!email.password && !initial?.email?.hasPassword) {
+        return '请填写邮箱授权码 / 密码。';
+      }
     }
     if (kind === 'phone') {
       if (!phone.phoneNumber) return '请填写手机号（含国家区号，例如 +8613800138000）。';
@@ -244,6 +286,83 @@ export function SourceForm({
     } finally {
       setTesting(false);
     }
+  }
+
+  /* -------------------------------------------- Microsoft device-code login */
+
+  const flowId = oauthFlow?.flowId ?? null;
+  const flowStatus = oauthFlow?.status ?? null;
+  const flowIntervalSec = oauthFlow?.intervalSec ?? 5;
+
+  /**
+   * Polls the main process while an authorisation is outstanding. Only the
+   * status travels over IPC — the tokens stay in the main process and never
+   * reach this side of the bridge.
+   */
+  useEffect(() => {
+    if (!open || !flowId) return;
+    if (flowStatus !== 'pending' && flowStatus !== 'slow_down') return;
+
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const result = await api.sources.msLoginPoll(flowId);
+          if (cancelled) return;
+          setOauthFlow((prev) =>
+            prev && prev.flowId === flowId
+              ? { ...prev, status: result.status, message: result.message }
+              : prev,
+          );
+        } catch {
+          /* transient — the next tick retries */
+        }
+      })();
+    }, Math.max(5, flowIntervalSec) * 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [open, flowId, flowStatus, flowIntervalSec]);
+
+  async function startMicrosoftLogin(): Promise<void> {
+    setOauthBusy(true);
+    setOauthError(null);
+    try {
+      if (flowId) await api.sources.msLoginCancel(flowId);
+      setOauthFlow(null);
+
+      const result = await api.sources.msLoginStart({ ...email });
+      if (!result.ok || !result.flowId) {
+        setOauthError(result.message);
+        return;
+      }
+      setOauthFlow({
+        flowId: result.flowId,
+        userCode: result.userCode ?? '',
+        verificationUri: result.verificationUri ?? '',
+        intervalSec: result.intervalSec ?? 5,
+        status: 'pending',
+        message: result.message,
+      });
+    } catch (error) {
+      setOauthError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setOauthBusy(false);
+    }
+  }
+
+  /** Closes the dialog, abandoning any authorisation still outstanding. */
+  async function handleClose(): Promise<void> {
+    if (flowId && flowStatus !== 'success') {
+      try {
+        await api.sources.msLoginCancel(flowId);
+      } catch {
+        /* best effort — the flow expires on its own anyway */
+      }
+    }
+    onClose();
   }
 
   function applyPreset(preset: SourcePreset): void {
@@ -298,7 +417,7 @@ export function SourceForm({
   }
 
   return (
-    <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
+    <Dialog open={open} onClose={() => void handleClose()} maxWidth="sm" fullWidth>
       <DialogTitle>{isEditing ? '编辑来源' : '新增来源'}</DialogTitle>
       <DialogContent dividers>
         <Stack spacing={2.5} sx={{ pt: 1 }}>
@@ -334,6 +453,18 @@ export function SourceForm({
 
           {kind === 'email' ? (
             <Stack spacing={2}>
+              <TextField
+                select
+                label="认证方式"
+                value={email.authType}
+                onChange={(event) =>
+                  setEmail({ ...email, authType: event.target.value as EmailAuthType })
+                }
+                fullWidth
+              >
+                <MenuItem value="password">密码 / 授权码（QQ、163、Gmail 等）</MenuItem>
+                <MenuItem value="oauth2">Microsoft 账户登录（Outlook / Hotmail / M365）</MenuItem>
+              </TextField>
               <Box>
                 <Typography variant="caption" color="text.secondary">
                   快捷预设
@@ -381,14 +512,92 @@ export function SourceForm({
                 onChange={(event) => setEmail({ ...email, username: event.target.value.trim() })}
                 fullWidth
               />
-              <TextField
-                label={initial?.email?.hasPassword ? '授权码 / 密码（留空表示不修改）' : '授权码 / 密码'}
-                type="password"
-                value={email.password}
-                onChange={(event) => setEmail({ ...email, password: event.target.value })}
-                helperText="网易 163/126、QQ 邮箱必须先开启 IMAP 服务并生成「授权码」，此处填授权码，不是网页登录密码。"
-                fullWidth
-              />
+              {email.authType === 'password' ? (
+                <TextField
+                  label={initial?.email?.hasPassword ? '授权码 / 密码（留空表示不修改）' : '授权码 / 密码'}
+                  type="password"
+                  value={email.password}
+                  onChange={(event) => setEmail({ ...email, password: event.target.value })}
+                  helperText="网易 163/126、QQ 邮箱必须先开启 IMAP 服务并生成「授权码」，此处填授权码，不是网页登录密码。"
+                  fullWidth
+                />
+              ) : (
+                <Stack spacing={2}>
+                  <Alert severity="info">
+                    微软已停用 IMAP 的密码登录（服务器直接返回 LOGINDISABLED），网页密码与应用密码都无法使用，
+                    必须走 OAuth 2.0。请先注册一个免费 Azure 应用，把它的 Application (client) ID 填在下面。
+                  </Alert>
+                  <TextField
+                    label="Application (client) ID"
+                    value={email.clientId}
+                    onChange={(event) => setEmail({ ...email, clientId: event.target.value.trim() })}
+                    helperText="在 portal.azure.com → Microsoft Entra ID → 应用注册 中创建，并开启「允许公共客户端流」。"
+                    fullWidth
+                  />
+                  <TextField
+                    label="租户"
+                    value={email.tenant}
+                    onChange={(event) => setEmail({ ...email, tenant: event.target.value.trim() })}
+                    helperText="个人账户填 consumers，工作/学校账户填 organizations 或租户 ID；不确定就保持 common。"
+                    fullWidth
+                  />
+                  <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <Button
+                      variant="outlined"
+                      startIcon={<LoginOutlinedIcon />}
+                      disabled={oauthBusy || !email.clientId.trim()}
+                      onClick={() => void startMicrosoftLogin()}
+                    >
+                      {oauthBusy ? '正在获取设备码…' : oauthFlow ? '重新登录' : '使用 Microsoft 账户登录'}
+                    </Button>
+                    {initial?.email?.hasRefreshToken && !oauthFlow ? (
+                      <Typography variant="caption" color="text.secondary">
+                        该来源已完成授权，未重新登录则沿用现有令牌。
+                      </Typography>
+                    ) : null}
+                  </Box>
+
+                  {oauthFlow ? (
+                    <Alert
+                      severity={
+                        oauthFlow.status === 'success'
+                          ? 'success'
+                          : oauthFlow.status === 'error'
+                            ? 'error'
+                            : 'info'
+                      }
+                    >
+                      {oauthFlow.status === 'success' ? (
+                        <>登录成功，令牌已加密保存在本机。点击「保存」即可创建来源。</>
+                      ) : oauthFlow.status === 'error' ? (
+                        oauthFlow.message
+                      ) : (
+                        <>
+                          在浏览器打开授权页面，输入代码{' '}
+                          <strong style={{ letterSpacing: 2 }}>{oauthFlow.userCode}</strong> 并完成登录。
+                          <br />
+                          {oauthFlow.message}
+                        </>
+                      )}
+                      {oauthFlow.status !== 'error' && oauthFlow.verificationUri ? (
+                        <Box sx={{ mt: 1 }}>
+                          <Button
+                            size="small"
+                            startIcon={<OpenInNewOutlinedIcon />}
+                            onClick={() =>
+                              void api.system.openExternal(oauthFlow.verificationUri ?? '')
+                            }
+                          >
+                            打开授权页面
+                          </Button>
+                        </Box>
+                      ) : null}
+                    </Alert>
+                  ) : null}
+
+                  {oauthError ? <Alert severity="error">{oauthError}</Alert> : null}
+                </Stack>
+              )}
               <TextField
                 label="邮箱文件夹"
                 value={email.mailbox}
@@ -556,7 +765,7 @@ export function SourceForm({
             {testing ? '测试中…' : '测试连接'}
           </Button>
         ) : null}
-        <Button onClick={onClose} color="inherit">
+        <Button onClick={() => void handleClose()} color="inherit">
           取消
         </Button>
         <Button onClick={() => void handleSubmit()} variant="contained" disabled={submitting}>
