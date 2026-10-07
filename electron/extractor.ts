@@ -48,6 +48,16 @@ interface KeywordHit {
   index: number;
 }
 
+/**
+ * Minimum confidence a candidate must reach before it may enter the inbox.
+ *
+ * Keyword-anchored codes score around 0.82 while accidental digit runs pulled
+ * out of dates, ids, amounts or addresses land at 0.2 or below, so this
+ * threshold separates the two cleanly without discarding genuine codes that
+ * merely happen to lack an expiry hint.
+ */
+export const MIN_CONFIDENCE = 0.45;
+
 interface Candidate {
   value: string;
   index: number;
@@ -85,6 +95,23 @@ function collectKeywordHits(lowerHaystack: string): KeywordHit[] {
 function groupIndex(match: RegExpExecArray, group: number): number {
   const prefix = match[0].slice(0, match[0].indexOf(match[group]));
   return match.index + prefix.length;
+}
+
+/**
+ * Blanks out tokens that can never hold a verification code yet frequently
+ * contain 4-8 digit runs: e-mail addresses (`user0412@example.com` yields
+ * `0412`), URLs and long opaque identifiers (commit shas, UUIDs).
+ *
+ * Replacing with spaces rather than deleting keeps every character index
+ * aligned with the original text, so keyword proximity and expiry detection —
+ * which run against the unmasked haystack — stay correct.
+ */
+function maskOpaqueTokens(text: string): string {
+  const blank = (match: string): string => ' '.repeat(match.length);
+  return text
+    .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, blank)
+    .replace(/(?:https?:\/\/|www\.)[^\s]+/gi, blank)
+    .replace(/\b[A-Za-z0-9_-]{12,}\b/g, blank);
 }
 
 function collectCandidates(text: string): Candidate[] {
@@ -145,6 +172,7 @@ function distractorPenalty(text: string, index: number, length: number): number 
   let penalty = 0;
   const before = text.slice(Math.max(0, index - 3), index);
   const after = text.slice(index + length, index + length + 6);
+  const surroundings = text.slice(Math.max(0, index - 8), index + length + 8);
 
   if (/[¥$￥€]/.test(before)) penalty += 0.7;
   if (/(元|美元|usd|cny|rmb|金额|余额|价格)/i.test(after)) penalty += 0.3;
@@ -152,6 +180,13 @@ function distractorPenalty(text: string, index: number, length: number): number 
   // Years like 2024 / 1999 read as dates rather than codes.
   const year = text.slice(index, index + 4);
   if (/^(19|20)\d{2}$/.test(year) && length === 4) penalty += 0.2;
+
+  // Being part of a date (`2026-10-05`, `2026年10月5日`) is far stronger
+  // evidence than a bare four-digit year, so this outweighs the keyword bonus.
+  if (/\d{4}\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}/.test(surroundings)) penalty += 0.5;
+
+  // Clock times (`19:59:46`) are likewise never verification codes.
+  if (/\d{1,2}:\d{2}(?::\d{2})?/.test(surroundings)) penalty += 0.3;
 
   // Long digit runs (order ids) get penalised while still allowing matches.
   if (length >= 7 && /^\d+$/.test(text.slice(index, index + length))) penalty += 0.1;
@@ -213,7 +248,11 @@ export function extractCode(input: ExtractInput, now: number = Date.now()): Extr
 
   const lowerHaystack = haystack.toLowerCase();
   const keywordHits = collectKeywordHits(lowerHaystack);
-  const candidates = collectCandidates(haystack);
+  // Candidates come from a masked copy so digit runs buried in e-mail
+  // addresses, URLs or long ids never surface as codes. Masking preserves
+  // length, so the indices still line up with the unmasked haystack used for
+  // scoring, expiry hints and distractor penalties.
+  const candidates = collectCandidates(maskOpaqueTokens(haystack));
   if (candidates.length === 0) return null;
 
   let best: ScoredCandidate | null = null;

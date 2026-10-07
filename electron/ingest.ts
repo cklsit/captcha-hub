@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { fetchRecentMails, describeImapError } from './imap';
-import { extractCode, resolveSourceForMail } from './extractor';
+import { extractCode, resolveSourceForMail, MIN_CONFIDENCE } from './extractor';
 import { broadcast } from './events';
 import * as store from './store';
 import type { CaptchaMessage, Source, SourceSyncResult, SyncResult, SyncStatusInfo } from '../shared/types';
@@ -13,6 +13,25 @@ import type { CaptchaMessage, Source, SourceSyncResult, SyncResult, SyncStatusIn
 
 const FETCH_LIMIT = 30;
 const SUMMARY_LENGTH = 180;
+
+/**
+ * Decides whether a fetched mail may enter the inbox.
+ *
+ * Baseline (`receivedAt >= baseline`): only codes arriving *after* the source
+ * was added are imported. A mailbox's back catalogue is none of our business —
+ * importing it floods the inbox with stale codes and, worse, with old mails
+ * that merely contain a number.
+ *
+ * Threshold: extractions scoring below `MIN_CONFIDENCE` are speculative digit
+ * runs (dates, order ids, amounts, address fragments) rather than codes.
+ */
+export function isIngestible(
+  receivedAt: number,
+  baseline: number,
+  confidence: number,
+): boolean {
+  return receivedAt >= baseline && confidence >= MIN_CONFIDENCE;
+}
 
 let syncing = false;
 let lastRun: SyncResult | null = null;
@@ -46,6 +65,8 @@ export async function syncSource(source: Source): Promise<SourceSyncResult> {
     const collected: CaptchaMessage[] = [];
 
     for (const mail of mails) {
+      const receivedAt = mail.date.getTime();
+
       const extracted = extractCode({ subject: mail.subject, text: mail.text, from: mail.from });
       if (!extracted) continue;
 
@@ -55,6 +76,12 @@ export async function syncSource(source: Source): Promise<SourceSyncResult> {
         allSources,
       );
       if (!resolved) continue;
+
+      // The mailbox source's own creation time, plus — for mail claimed by a
+      // phone forwarding rule — the moment that rule was created, so a rule
+      // added later cannot retroactively claim older messages.
+      const baseline = Math.max(source.createdAt, resolved.source.createdAt);
+      if (!isIngestible(receivedAt, baseline, extracted.confidence)) continue;
 
       collected.push({
         id: randomUUID(),
@@ -68,7 +95,7 @@ export async function syncSource(source: Source): Promise<SourceSyncResult> {
         subject: mail.subject || '(无主题)',
         from: mail.from || '(未知发件人)',
         summary: summarize(mail.text),
-        receivedAt: mail.date.getTime(),
+        receivedAt,
         ingestedAt: Date.now(),
         read: false,
         uid: mail.uid,

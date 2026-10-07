@@ -14,6 +14,7 @@ import type {
   SyncStatusInfo,
   TotpDisplay,
   TotpExportItem,
+  TotpScanResult,
 } from '../shared/types';
 
 /**
@@ -57,6 +58,8 @@ const api: CaptchaHubApi = {
       ipcRenderer.invoke('totp:export', includeSecrets),
     import: (items: TotpExportItem[]): Promise<SafeSource[]> =>
       ipcRenderer.invoke('totp:import', items),
+    scanImage: (): Promise<TotpScanResult> => ipcRenderer.invoke('totp:scanImage'),
+    scanClipboard: (): Promise<TotpScanResult> => ipcRenderer.invoke('totp:scanClipboard'),
   },
   settings: {
     get: (): Promise<AppSettings> => ipcRenderer.invoke('settings:get'),

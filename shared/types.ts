@@ -44,6 +44,17 @@ export interface TotpSecret {
   note: string;
 }
 
+/** TOTP entry decoded from a QR code — everything except the free-form note. */
+export type TotpScanDraft = Omit<TotpSecret, 'note'>;
+
+/** Outcome of scanning a 2FA enrolment QR code (image file or clipboard). */
+export interface TotpScanResult {
+  ok: boolean;
+  message: string;
+  /** Present only when `ok` is true. */
+  draft?: TotpScanDraft;
+}
+
 /**
  * A fully-resolved source as used inside the main process (contains plaintext
  * secrets after decryption). Never send this object to the renderer.
@@ -226,6 +237,10 @@ export interface CaptchaHubApi {
     list(): Promise<TotpDisplay[]>;
     export(includeSecrets: boolean): Promise<TotpExportItem[]>;
     import(items: TotpExportItem[]): Promise<SafeSource[]>;
+    /** Opens a file picker, decodes the QR code and returns a form prefill. */
+    scanImage(): Promise<TotpScanResult>;
+    /** Decodes the QR code currently on the clipboard. */
+    scanClipboard(): Promise<TotpScanResult>;
   };
   settings: {
     get(): Promise<AppSettings>;

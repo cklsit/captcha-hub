@@ -14,6 +14,8 @@ import Stack from '@mui/material/Stack';
 import Switch from '@mui/material/Switch';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
+import ContentPasteOutlinedIcon from '@mui/icons-material/ContentPasteOutlined';
+import QrCodeScannerOutlinedIcon from '@mui/icons-material/QrCodeScannerOutlined';
 import type {
   ConnectionTestResult,
   MatchField,
@@ -22,7 +24,9 @@ import type {
   SourceKind,
   SourcePreset,
   TotpAlgorithm,
+  TotpScanResult,
 } from '../../shared/types';
+import { api } from '../api';
 
 interface SourceFormProps {
   open: boolean;
@@ -104,6 +108,8 @@ export function SourceForm({
   const [totp, setTotp] = useState<TotpFormState>(EMPTY_TOTP);
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
+  const [scanResult, setScanResult] = useState<TotpScanResult | null>(null);
+  const [scanning, setScanning] = useState(false);
   const [testing, setTesting] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
@@ -114,6 +120,7 @@ export function SourceForm({
     if (!open) return;
     setError(null);
     setTestResult(null);
+    setScanResult(null);
     if (initial) {
       setKind(initial.kind);
       setName(initial.name);
@@ -244,6 +251,45 @@ export function SourceForm({
       port: preset.port,
       secure: preset.secure,
     }));
+  }
+
+  /**
+   * Decodes a 2FA enrolment QR code — from an image file or straight off the
+   * clipboard — and prefills the TOTP fields, so the user only has to confirm
+   * and save instead of copying a Base32 secret by hand.
+   */
+  async function handleScan(from: 'image' | 'clipboard'): Promise<void> {
+    setScanning(true);
+    setScanResult(null);
+    try {
+      const result = from === 'image' ? await api.totp.scanImage() : await api.totp.scanClipboard();
+      setScanResult(result);
+      if (!result.ok || !result.draft) return;
+
+      const { draft } = result;
+      setTotp((prev) => ({
+        ...prev,
+        algorithm: draft.algorithm,
+        digits: draft.digits,
+        period: draft.period,
+        secret: draft.secret,
+        issuer: draft.issuer || prev.issuer,
+        account: draft.account || prev.account,
+      }));
+
+      // Offer a sensible source name when the user has not typed one yet.
+      if (!name.trim()) {
+        const label = [draft.issuer, draft.account].filter(Boolean).join(' · ');
+        if (label) setName(label);
+      }
+    } catch (scanError) {
+      setScanResult({
+        ok: false,
+        message: scanError instanceof Error ? scanError.message : String(scanError),
+      });
+    } finally {
+      setScanning(false);
+    }
   }
 
   return (
@@ -409,6 +455,32 @@ export function SourceForm({
               <Alert severity="info">
                 TOTP 密钥仅在本机加密保存，绝不会上传。生成验证码在主进程完成。
               </Alert>
+              <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  startIcon={<QrCodeScannerOutlinedIcon />}
+                  disabled={scanning}
+                  onClick={() => void handleScan('image')}
+                >
+                  {scanning ? '识别中…' : '扫描二维码图片'}
+                </Button>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  startIcon={<ContentPasteOutlinedIcon />}
+                  disabled={scanning}
+                  onClick={() => void handleScan('clipboard')}
+                >
+                  从剪贴板读取
+                </Button>
+                <Typography variant="caption" color="text.secondary">
+                  支持 Google Authenticator / Authy 等生成的二维码
+                </Typography>
+              </Box>
+              {scanResult ? (
+                <Alert severity={scanResult.ok ? 'success' : 'error'}>{scanResult.message}</Alert>
+              ) : null}
               <TextField
                 label={initial?.totp?.hasSecret ? 'Base32 密钥（留空表示不修改）' : 'Base32 密钥'}
                 value={totp.secret}

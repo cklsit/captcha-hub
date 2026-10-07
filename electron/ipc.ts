@@ -1,9 +1,11 @@
-import { dialog, ipcMain } from 'electron';
+import { clipboard, dialog, ipcMain, nativeImage, type NativeImage } from 'electron';
 import { readFile, writeFile } from 'node:fs/promises';
 import * as store from './store';
 import { SOURCE_PRESETS } from './presets';
 import { testImapConnection } from './imap';
 import { generateTotp } from './totp';
+import { parseOtpAuthUri } from './otpauth';
+import { bgraToRgba, decodeQrPixels } from './qr';
 import { getSyncStatus, syncAll } from './ingest';
 import { restartScheduler } from './scheduler';
 import { applyLoginItem } from './autostart';
@@ -21,6 +23,7 @@ import type {
   SyncStatusInfo,
   TotpDisplay,
   TotpExportItem,
+  TotpScanResult,
 } from '../shared/types';
 
 /**
@@ -87,22 +90,112 @@ function applySettings(patch: Partial<AppSettings>): AppSettings {
   return updated;
 }
 
+/**
+ * Kicks off a sync the moment a source is added, edited or switched on, so the
+ * inbox fills itself without the user having to press 立即同步.
+ *
+ * Deliberately not awaited and never surfaced as a dialog: the create/edit
+ * dialog must close instantly, and any failure is already recorded per source
+ * by the ingest layer and rendered in the source list.
+ */
+function syncInBackground(): void {
+  void syncAll().catch(() => {
+    /* per-source sync errors are persisted by ingest.ts */
+  });
+}
+
+/**
+ * Decodes the first QR code found in a bitmap.
+ *
+ * A screenshot pasted at 100% is frequently only ~200px across, which jsQR
+ * decodes unreliably, so a 2× upscale is retried before admitting defeat.
+ */
+function decodeQrFromImage(image: NativeImage): string | null {
+  const size = image.getSize();
+  if (size.width <= 0 || size.height <= 0) return null;
+
+  const direct = decodeQrPixels(bgraToRgba(image.toBitmap()), size.width, size.height);
+  if (direct) return direct;
+
+  const scaled = image.resize({
+    width: size.width * 2,
+    height: size.height * 2,
+    quality: 'best',
+  });
+  const scaledSize = scaled.getSize();
+  return decodeQrPixels(bgraToRgba(scaled.toBitmap()), scaledSize.width, scaledSize.height);
+}
+
+/** Turns a scanned payload into a form prefill, or an actionable failure. */
+function toScanResult(payload: string | null): TotpScanResult {
+  if (!payload) {
+    return {
+      ok: false,
+      message: '没有在图片中识别到二维码。请换一张更清晰、且四周留有白边的截图重试。',
+    };
+  }
+
+  const draft = parseOtpAuthUri(payload);
+  if (!draft) {
+    // The payload is never echoed back — it would leak the TOTP secret into the UI.
+    return {
+      ok: false,
+      message:
+        '识别到的二维码不是 TOTP 配置。本应用只支持 otpauth://totp 开头的二维码（Google Authenticator、Authy、1Password 等生成的即是）。',
+    };
+  }
+
+  const label = draft.issuer || draft.account || '未命名验证器';
+  return { ok: true, message: `已从二维码读取：${label}`, draft };
+}
+
+async function scanTotpQrFromFile(): Promise<TotpScanResult> {
+  const result = await dialog.showOpenDialog({
+    title: '选择包含 2FA 二维码的图片',
+    properties: ['openFile'],
+    filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'] }],
+  });
+  if (result.canceled || result.filePaths.length === 0) {
+    return { ok: false, message: '已取消选择图片。' };
+  }
+
+  const image = nativeImage.createFromPath(result.filePaths[0]);
+  if (image.isEmpty()) {
+    return { ok: false, message: '无法读取该图片文件，请确认格式为 PNG / JPG / WEBP。' };
+  }
+  return toScanResult(decodeQrFromImage(image));
+}
+
+function scanTotpQrFromClipboard(): TotpScanResult {
+  const image = clipboard.readImage();
+  if (image.isEmpty()) {
+    return { ok: false, message: '剪贴板里没有图片。请先截图或复制二维码图片，再点此按钮。' };
+  }
+  return toScanResult(decodeQrFromImage(image));
+}
+
 export function registerIpc(): void {
   // --- sources -------------------------------------------------------------
   ipcMain.handle('sources:list', (): SafeSource[] => store.listSafeSources());
   ipcMain.handle('sources:presets', (): SourcePreset[] => SOURCE_PRESETS);
-  ipcMain.handle('sources:create', (_event, input: SourceInput): SafeSource =>
-    store.createSource(input),
-  );
-  ipcMain.handle('sources:update', (_event, id: string, input: SourceInput): SafeSource =>
-    store.updateSource(id, input),
-  );
+  ipcMain.handle('sources:create', (_event, input: SourceInput): SafeSource => {
+    const created = store.createSource(input);
+    if (created.kind === 'email' && created.enabled) syncInBackground();
+    return created;
+  });
+  ipcMain.handle('sources:update', (_event, id: string, input: SourceInput): SafeSource => {
+    const updated = store.updateSource(id, input);
+    if (updated.kind === 'email' && updated.enabled) syncInBackground();
+    return updated;
+  });
   ipcMain.handle('sources:delete', (_event, id: string): void => {
     store.deleteSource(id);
   });
-  ipcMain.handle('sources:toggle', (_event, id: string, enabled: boolean): SafeSource =>
-    store.setSourceEnabled(id, enabled),
-  );
+  ipcMain.handle('sources:toggle', (_event, id: string, enabled: boolean): SafeSource => {
+    const toggled = store.setSourceEnabled(id, enabled);
+    if (toggled.kind === 'email' && toggled.enabled) syncInBackground();
+    return toggled;
+  });
   ipcMain.handle('sources:test', (_event, input: SourceInput): Promise<ConnectionTestResult> =>
     testSource(input),
   );
@@ -132,6 +225,8 @@ export function registerIpc(): void {
   ipcMain.handle('totp:import', (_event, items: TotpExportItem[]): SafeSource[] =>
     store.importTotp(items),
   );
+  ipcMain.handle('totp:scanImage', (): Promise<TotpScanResult> => scanTotpQrFromFile());
+  ipcMain.handle('totp:scanClipboard', (): TotpScanResult => scanTotpQrFromClipboard());
 
   // --- settings ------------------------------------------------------------
   ipcMain.handle('settings:get', (): AppSettings => store.getSettings());
