@@ -58,6 +58,24 @@ interface KeywordHit {
  */
 export const MIN_CONFIDENCE = 0.45;
 
+/**
+ * Decides whether a fetched mail may enter the inbox.
+ *
+ * Baseline (`receivedAt >= baseline`): only codes arriving *after* the source
+ * was added are imported. A mailbox's back catalogue is none of our business —
+ * importing it floods the inbox with stale codes and, worse, with old mails
+ * that merely happen to contain a number.
+ *
+ * Threshold: extractions scoring below `MIN_CONFIDENCE` are speculative digit
+ * runs (dates, order ids, amounts, address fragments) rather than codes.
+ *
+ * Lives here rather than in `ingest.ts` on purpose: this file has no Electron
+ * or Node dependency, so it stays unit-testable in a headless CI runner.
+ */
+export function isIngestible(receivedAt: number, baseline: number, confidence: number): boolean {
+  return receivedAt >= baseline && confidence >= MIN_CONFIDENCE;
+}
+
 interface Candidate {
   value: string;
   index: number;

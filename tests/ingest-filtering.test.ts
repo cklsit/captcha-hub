@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractCode, MIN_CONFIDENCE } from '../electron/extractor';
-import { isIngestible } from '../electron/ingest';
+import { extractCode, isIngestible, MIN_CONFIDENCE } from '../electron/extractor';
 
 /**
  * Regressions for the two complaints that prompted this filter:

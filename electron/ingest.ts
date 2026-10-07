@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { fetchRecentMails, describeImapError } from './imap';
-import { extractCode, resolveSourceForMail, MIN_CONFIDENCE } from './extractor';
+import { extractCode, isIngestible, resolveSourceForMail } from './extractor';
 import { broadcast } from './events';
 import * as store from './store';
 import type { CaptchaMessage, Source, SourceSyncResult, SyncResult, SyncStatusInfo } from '../shared/types';
@@ -13,25 +13,6 @@ import type { CaptchaMessage, Source, SourceSyncResult, SyncResult, SyncStatusIn
 
 const FETCH_LIMIT = 30;
 const SUMMARY_LENGTH = 180;
-
-/**
- * Decides whether a fetched mail may enter the inbox.
- *
- * Baseline (`receivedAt >= baseline`): only codes arriving *after* the source
- * was added are imported. A mailbox's back catalogue is none of our business —
- * importing it floods the inbox with stale codes and, worse, with old mails
- * that merely contain a number.
- *
- * Threshold: extractions scoring below `MIN_CONFIDENCE` are speculative digit
- * runs (dates, order ids, amounts, address fragments) rather than codes.
- */
-export function isIngestible(
-  receivedAt: number,
-  baseline: number,
-  confidence: number,
-): boolean {
-  return receivedAt >= baseline && confidence >= MIN_CONFIDENCE;
-}
 
 let syncing = false;
 let lastRun: SyncResult | null = null;
