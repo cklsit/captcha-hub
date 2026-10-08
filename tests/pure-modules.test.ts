@@ -36,6 +36,7 @@ const PURE_ENTRY_POINTS = [
   'electron/migrate-core.ts',
   'electron/ingest-core.ts',
   'electron/settings.ts',
+  'electron/secret-at-rest.ts',
 ];
 
 const IMPORT_RE = /(?:from\s*|require\(\s*)['"]([^'"]+)['"]/g;

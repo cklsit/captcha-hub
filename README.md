@@ -183,5 +183,9 @@ npm test
   旧版本授权、缺少该 scope，首次发信时应用会提示重新登录一次。
   步骤见 [`docs/microsoft-oauth-setup.md`](docs/microsoft-oauth-setup.md)。
 - 发信副本依赖服务器自身写入 Sent 文件夹；本地仅在索引补插一条已发送记录，不做 IMAP `APPEND`。
+- **个人 Microsoft 账户目前无法注册 Azure 应用**：`@outlook.com` / `@hotmail.com` 默认被归到
+  没有目录的 "Microsoft Services" 租户，在 Azure 门户上会得到 `AADSTS50020`。这是微软侧的
+  账户策略，应用无法绕过；请改用转发，或先用无痕窗口创建 Azure 免费账户获得真实租户。
+  应用会识别该错误并给出对应说明，不会误导成「密码错误」。
 - 正文搜索为**按需扫描**（并发/结果上限/渐进返回），不承诺全文索引级即时性。
 - 提取引擎为启发式实现，覆盖主流验证码模板，不保证 100% 准确。

@@ -5,7 +5,7 @@ import { registerIpc } from './ipc';
 import { migrate } from './migrate';
 import { applyLoginItem } from './autostart';
 import { startScheduler, stopScheduler } from './scheduler';
-import { getSettings } from './store';
+import { getSettings, repairStoredSecrets } from './store';
 
 /**
  * Electron main entry point.
@@ -100,6 +100,15 @@ if (!app.requestSingleInstanceLock()) {
       migrate();
     } catch {
       /* a migration failure must never block startup */
+    }
+
+    // Re-seal secrets an older build may have written in the clear. Cheap when
+    // there is nothing to fix, and it makes the file clean on the very next
+    // boot instead of waiting for each account to be re-saved by hand.
+    try {
+      repairStoredSecrets();
+    } catch {
+      /* never block startup over a repair attempt */
     }
 
     registerIpc();

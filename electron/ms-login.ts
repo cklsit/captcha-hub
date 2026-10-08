@@ -4,6 +4,8 @@ import {
   MS_DEFAULT_TENANT,
   MS_SCOPES,
   classifyTokenResponse,
+  describeClientId,
+  describeMicrosoftAuthError,
   deviceCodeEndpoint,
   parseDeviceCodeResponse,
   postForm,
@@ -130,11 +132,11 @@ async function startDeviceLogin(clientId: string, tenant: string): Promise<MsLog
     if (!info) {
       const raw = payload as Record<string, unknown> | null;
       const detail = raw ? String(raw.error_description ?? raw.error ?? '') : '';
+      const hint = describeMicrosoftAuthError(detail);
       return {
         ok: false,
-        message: detail
-          ? `无法获取设备码：${detail}`
-          : '无法获取设备码，请检查 Application (client) ID 与网络。',
+        message:
+          hint ?? (detail ? `无法获取设备码：${detail}` : '无法获取设备码，请检查 Application (client) ID 与网络。'),
       };
     }
 
@@ -177,8 +179,10 @@ export async function msLoginStart(
   tenant: string,
   loginHint = '',
 ): Promise<MsLoginStartResult> {
+  const problem = describeClientId(clientId);
+  if (problem) return { ok: false, message: problem };
+
   const id = clientId.trim();
-  if (!id) return { ok: false, message: '请先填写 Application (client) ID。' };
   const tenantId = (tenant || '').trim() || MS_DEFAULT_TENANT;
 
   try {
@@ -266,9 +270,11 @@ async function pollRedirect(flowId: string, entry: PendingLogin): Promise<MsLogi
 
   if (got?.kind === 'error') {
     cancelLogin(flowId);
+    const detail = got.description || got.error || '';
     return {
       status: 'error',
-      message: `Microsoft 拒绝了本次授权：${got.description || got.error}`,
+      message:
+        describeMicrosoftAuthError(detail) ?? `Microsoft 拒绝了本次授权：${detail || '未知原因'}`,
     };
   }
 

@@ -219,6 +219,14 @@ export function classifyTokenResponse(payload: unknown, now: number = Date.now()
       : { status: 'error', message: 'Microsoft 未返回访问令牌，请重试。' };
   }
 
+  // An Entra code inside the description is more specific than the generic
+  // OAuth error name, so it wins. The same `invalid_grant` means "the code
+  // expired" in one case and "this account lives in a directory-less tenant"
+  // in another, and only the code tells the two apart — which is exactly the
+  // confusion this whole module exists to remove.
+  const hint = describeMicrosoftAuthError(errorDescription(raw));
+  if (hint) return { status: 'error', message: hint };
+
   switch (error) {
     case 'authorization_pending':
       return { status: 'pending', message: '等待你在浏览器中完成授权…' };
@@ -238,8 +246,14 @@ export function classifyTokenResponse(payload: unknown, now: number = Date.now()
       };
     case 'invalid_grant':
       return { status: 'error', message: '授权已失效或被撤销，请重新发起登录。' };
-    default:
-      return { status: 'error', message: `Microsoft 返回错误：${error}（${errorDescription(raw)}）` };
+    default: {
+      const detail = errorDescription(raw);
+      const hint = describeMicrosoftAuthError(detail);
+      return {
+        status: 'error',
+        message: hint ?? `Microsoft 返回错误：${error}（${detail}）`,
+      };
+    }
   }
 }
 
@@ -250,6 +264,112 @@ export function isAccessTokenFresh(
   skewMs: number = EXPIRY_SKEW_MS,
 ): boolean {
   return expiresAt > now + skewMs;
+}
+
+/* --------------------------------------------------- client id / errors -- */
+
+/**
+ * Microsoft's own client IDs, which users paste into the Client ID field by
+ * mistake more often than you would think: the value is right there in the
+ * Azure portal's own sign-in error page and in the portal's address bar.
+ *
+ * Signing in with one of these asks Microsoft to authorise *Microsoft's*
+ * application, so the consent screen and every subsequent error describe
+ * somebody else's app. Catching it before the browser opens is far kinder than
+ * letting the user read `AADSTS50020` and guess.
+ */
+export const KNOWN_FIRST_PARTY_CLIENT_IDS: Record<string, string> = {
+  '74658136-14ec-4630-ad9b-26e160ff0fc6': 'Azure 门户（ADIbizaUX）',
+  'c44b4083-3bb0-49c1-b47d-974e53cbdf3c': 'Azure 门户',
+  '04b07795-8ddb-461a-bbee-02f9e1bf7b46': 'Azure CLI',
+  '1950a258-227b-4e31-a9cf-717495945fc2': 'Azure PowerShell',
+  'd3590ed6-52b3-4102-aeff-aad2292ab01c': 'Microsoft Office',
+  '1fec8e78-bce4-4aaf-ab1b-5451cc387264': 'Microsoft Teams',
+};
+
+const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Explains why a Client ID cannot possibly work, or returns null when it looks
+ * usable. Only structural problems are rejected — whether the app exists,
+ * supports personal accounts and has the right permissions can only be learned
+ * from Microsoft.
+ */
+export function describeClientId(clientId: string): string | null {
+  const id = clientId.trim().toLowerCase();
+  if (!id) return '请先填写 Application (client) ID。';
+
+  const owner = KNOWN_FIRST_PARTY_CLIENT_IDS[id];
+  if (owner) {
+    return (
+      `这个 ID 属于 Microsoft 自家的应用（${owner}），不是你注册的应用，无法用来登录你自己的邮箱。` +
+      '请到 Azure「应用注册」新建一个应用，复制它「概述」页里的「应用程序(客户端) ID」。'
+    );
+  }
+
+  if (!GUID.test(id)) {
+    return (
+      'Application (client) ID 应形如 00000000-0000-0000-0000-000000000000。' +
+      '注意不要复制成「对象 ID」或「目录(租户) ID」——它们是同一页上的另外两个值。'
+    );
+  }
+
+  return null;
+}
+
+/**
+ * Turns the Entra error codes users actually hit into something actionable.
+ * The service reports these inside `error_description`, either on the loopback
+ * callback or from the token endpoint, so the raw text is the only input here.
+ *
+ * Returns null when the text carries no code we recognise, leaving the caller
+ * free to show Microsoft's own wording.
+ */
+export function describeMicrosoftAuthError(text: string): string | null {
+  if (!text) return null;
+
+  // A personal Microsoft account lives in the "Microsoft Services" tenant,
+  // which has no directory — so it can neither host an app registration nor be
+  // granted access to one. Nothing the user types into this app can change it.
+  if (/AADSTS50020|AADSTS16000|AADSTS160021|AADSTS50058/.test(text)) {
+    return (
+      '这个 Microsoft 账户被归在了「Microsoft Services」租户下，而该租户没有可用目录，' +
+      '因此既不能注册应用、也不能被授权访问应用。这是个人账户（outlook.com / hotmail.com）' +
+      '目前的默认行为，与密码是否正确无关。\n' +
+      '可行的做法：① 让邮件转发到你已经配好的邮箱（本应用已支持）；' +
+      '② 用无痕窗口打开 https://azure.microsoft.com/free/ 注册 Azure 免费账户，' +
+      '这会生成一个真实租户并让你成为全局管理员，之后在该租户里注册应用；' +
+      '③ 或改用一个工作 / 学校账户。'
+    );
+  }
+
+  if (/AADSTS700038/.test(text)) {
+    return 'Application (client) ID 不是有效的应用标识，请从 Azure「应用注册 → 概述」重新复制。';
+  }
+
+  if (/AADSTS7000218|AADSTS7000222|invalid_client/i.test(text)) {
+    return (
+      '该应用未启用「允许公共客户端流（Allow public client flows）」，或 Client ID 填写有误。' +
+      '请在 Azure 应用 →「身份验证」页把它设为「是」并保存。'
+    );
+  }
+
+  if (/AADSTS65001|AADSTS65004|AADSTS500011|consent_required/i.test(text)) {
+    return (
+      '该应用缺少所需权限，或你尚未同意授权。请在 Azure 应用的「API 权限」中添加 ' +
+      'Office 365 Exchange Online 的 IMAP.AccessAsUser.All 与 SMTP.Send（均为「委托的权限」），' +
+      '然后重新登录。'
+    );
+  }
+
+  if (/AADSTS50011(?![0-9])|AADSTS500113/.test(text)) {
+    return (
+      '该应用尚未注册重定向地址 http://localhost。请在 Azure 应用 →「身份验证 → 添加平台 → ' +
+      '移动和桌面应用程序」中把它加为自定义重定向 URI，然后重新登录。'
+    );
+  }
+
+  return null;
 }
 
 /* ------------------------------------------------------------------- HTTP */

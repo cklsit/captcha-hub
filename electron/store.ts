@@ -4,6 +4,7 @@ import { decryptString, encryptString } from './crypto';
 import { MS_DEFAULT_TENANT } from './ms-oauth';
 import { getPendingTokens } from './ms-login';
 import { DEFAULT_SETTINGS, mergeSettings } from './settings';
+import { sealPlaintext } from './secret-at-rest';
 import { withTotpDefaults } from './totp';
 import type {
   Account,
@@ -64,6 +65,18 @@ function safeDecrypt(value: string): string {
 }
 
 /**
+ * The single write path for the account array.
+ *
+ * Callers always hand over *decrypted* accounts — that is what `getAccounts`
+ * returns — so every secret is re-encrypted here. Writing the array directly
+ * used to re-encrypt only the entry being touched and leave every *other*
+ * account's password and tokens in plaintext on disk; see `secret-at-rest.ts`.
+ */
+function saveAccounts(accounts: Account[]): void {
+  store().set('accounts', accounts.map(encryptAccount));
+}
+
+/**
  * Secrets are encrypted field by field. OAuth tokens matter as much as
  * passwords here: a refresh token is a durable, revocable key to the mailbox,
  * so it must never sit in the JSON file in the clear.
@@ -96,6 +109,14 @@ function decryptTotpEntry(entry: TotpEntry): TotpEntry {
   const next = clone(entry);
   if (next.totp.secret) next.totp.secret = safeDecrypt(next.totp.secret);
   return next;
+}
+
+/**
+ * The single write path for the TOTP array — same reasoning as
+ * {@link saveAccounts}: re-encrypt every entry, not just the one that changed.
+ */
+function saveTotpEntries(entries: TotpEntry[]): void {
+  store().set('totpEntries', entries.map(encryptTotpEntry));
 }
 
 function toSafeAccount(account: Account): SafeAccount {
@@ -264,7 +285,7 @@ export function createAccount(input: AccountInput): SafeAccount {
   const accounts = getAccounts();
   const created = buildAccount(input);
   accounts.push(encryptAccount(created));
-  store().set('accounts', accounts);
+  saveAccounts(accounts);
   return toSafeAccount(created);
 }
 
@@ -274,15 +295,12 @@ export function updateAccount(id: string, input: AccountInput): SafeAccount {
   if (index === -1) throw new Error(`账户不存在: ${id}`);
   const updated = buildAccount({ ...input, id }, accounts[index]);
   accounts[index] = encryptAccount(updated);
-  store().set('accounts', accounts);
+  saveAccounts(accounts);
   return toSafeAccount(updated);
 }
 
 export function deleteAccount(id: string): void {
-  store().set(
-    'accounts',
-    getAccounts().filter((account) => account.id !== id),
-  );
+  saveAccounts(getAccounts().filter((account) => account.id !== id));
 }
 
 export function setAccountEnabled(id: string, enabled: boolean): SafeAccount {
@@ -293,7 +311,7 @@ export function setAccountEnabled(id: string, enabled: boolean): SafeAccount {
   accounts[index].updatedAt = Date.now();
   const result = accounts[index];
   accounts[index] = encryptAccount(result);
-  store().set('accounts', accounts);
+  saveAccounts(accounts);
   return toSafeAccount(result);
 }
 
@@ -306,7 +324,7 @@ export function setAccountSyncFolders(id: string, paths: string[]): SafeAccount 
   accounts[index].updatedAt = Date.now();
   const result = accounts[index];
   accounts[index] = encryptAccount(result);
-  store().set('accounts', accounts);
+  saveAccounts(accounts);
   return toSafeAccount(result);
 }
 
@@ -323,7 +341,7 @@ export function setAccountSyncResult(
   accounts[index].lastSyncStatus = status;
   accounts[index].lastSyncError = error;
   accounts[index] = encryptAccount(accounts[index]);
-  store().set('accounts', accounts);
+  saveAccounts(accounts);
 }
 
 /**
@@ -343,7 +361,7 @@ export function updateAccountTokens(
   target.imap.accessTokenExpiresAt = tokens.expiresAt;
   if (tokens.scopes && tokens.scopes.length > 0) target.scopes = tokens.scopes;
   accounts[index] = encryptAccount(target);
-  store().set('accounts', accounts);
+  saveAccounts(accounts);
 }
 
 export function setAccountNeedsReauth(id: string, needsReauth: boolean): void {
@@ -352,12 +370,58 @@ export function setAccountNeedsReauth(id: string, needsReauth: boolean): void {
   if (index === -1) return;
   accounts[index].needsReauth = needsReauth;
   accounts[index] = encryptAccount(accounts[index]);
-  store().set('accounts', accounts);
+  saveAccounts(accounts);
 }
 
 /** Bulk write used by the migration path (plaintext secrets → encrypted). */
 export function replaceAccounts(accounts: Account[]): void {
-  store().set('accounts', accounts.map(encryptAccount));
+  saveAccounts(accounts);
+}
+
+/* ------------------------------------------------------- secret recovery */
+
+/**
+ * Re-seals any secret still sitting on disk in the clear, and returns how many
+ * fields had to be fixed.
+ *
+ * Older builds could persist plaintext (see `secret-at-rest.ts`), and merely
+ * fixing the write paths would leave already-leaked values lying around until
+ * the user happened to re-save each account. This runs once per boot so the
+ * file is clean immediately; already-sealed values are skipped, which makes a
+ * second call a no-op rather than a corruption.
+ */
+export function repairStoredSecrets(): number {
+  let repaired = 0;
+
+  const accounts = store()
+    .get('accounts')
+    .map((account) => {
+      const imap = sealPlaintext(account.imap, ['password', 'refreshToken', 'accessToken'], encryptString);
+      repaired += imap.sealed;
+
+      let next: Account = { ...account, imap: imap.value };
+      if (next.smtp) {
+        const smtp = sealPlaintext(next.smtp, ['password'], encryptString);
+        repaired += smtp.sealed;
+        next = { ...next, smtp: smtp.value };
+      }
+      return next;
+    });
+
+  const totp = store()
+    .get('totpEntries')
+    .map((entry) => {
+      const secret = sealPlaintext(entry.totp, ['secret'], encryptString);
+      repaired += secret.sealed;
+      return { ...entry, totp: secret.value };
+    });
+
+  if (repaired > 0) {
+    store().set('accounts', accounts);
+    store().set('totpEntries', totp);
+  }
+
+  return repaired;
 }
 
 /* ------------------------------------------------------------ totp entries */
@@ -393,7 +457,7 @@ export function createTotpEntry(input: TotpEntryInput): SafeTotpEntry {
   const entries = listTotpEntries();
   const created = buildTotpEntry(input);
   entries.push(encryptTotpEntry(created));
-  store().set('totpEntries', entries);
+  saveTotpEntries(entries);
   return toSafeTotpEntry(created);
 }
 
@@ -403,19 +467,16 @@ export function updateTotpEntry(id: string, input: TotpEntryInput): SafeTotpEntr
   if (index === -1) throw new Error(`验证器不存在: ${id}`);
   const updated = buildTotpEntry({ ...input, id }, entries[index]);
   entries[index] = encryptTotpEntry(updated);
-  store().set('totpEntries', entries);
+  saveTotpEntries(entries);
   return toSafeTotpEntry(updated);
 }
 
 export function deleteTotpEntry(id: string): void {
-  store().set(
-    'totpEntries',
-    listTotpEntries().filter((entry) => entry.id !== id),
-  );
+  saveTotpEntries(listTotpEntries().filter((entry) => entry.id !== id));
 }
 
 export function replaceTotpEntries(entries: TotpEntry[]): void {
-  store().set('totpEntries', entries.map(encryptTotpEntry));
+  saveTotpEntries(entries);
 }
 
 /** Export all TOTP secrets (optionally masked) for a user-initiated backup. */
@@ -542,7 +603,7 @@ export function importBackup(bundle: BackupBundle): void {
     accounts.push(encryptAccount(account));
     existingIds.add(account.id);
   }
-  store().set('accounts', accounts);
+  saveAccounts(accounts);
 
   if (Array.isArray(bundle.totpSecrets) && bundle.totpSecrets.length > 0) {
     importTotp(bundle.totpSecrets);
