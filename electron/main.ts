@@ -12,6 +12,26 @@ import { getSettings } from './store';
  * Owns the window, IPC registration, background polling and app lifecycle.
  */
 
+/**
+ * Last-resort safety net for the main process.
+ *
+ * This app holds background IMAP/SMTP connections open for hours at a time, so
+ * one stray async error — a socket timing out after its handler was released, a
+ * rejected promise nobody awaited — must not replace the window with Electron's
+ * fatal "A JavaScript error occurred in the main process" dialog.
+ *
+ * Both handlers log and carry on. Nothing is hidden from the user by doing so:
+ * account-level failures are already reported through the per-account sync
+ * status. This exists purely so a transport hiccup cannot take the app down.
+ */
+process.on('uncaughtException', (error) => {
+  console.error('[mail-hub] 主进程未捕获异常：', error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[mail-hub] 主进程未处理的 Promise 拒绝：', reason);
+});
+
 let mainWindow: BrowserWindow | null = null;
 
 /**

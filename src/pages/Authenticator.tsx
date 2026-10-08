@@ -7,14 +7,10 @@ import Dialog from '@mui/material/Dialog';
 import DialogActions from '@mui/material/DialogActions';
 import DialogContent from '@mui/material/DialogContent';
 import DialogTitle from '@mui/material/DialogTitle';
-import IconButton from '@mui/material/IconButton';
 import Stack from '@mui/material/Stack';
 import TextField from '@mui/material/TextField';
-import Tooltip from '@mui/material/Tooltip';
 import Typography from '@mui/material/Typography';
 import AddIcon from '@mui/icons-material/Add';
-import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
-import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import FileDownloadOutlinedIcon from '@mui/icons-material/FileDownloadOutlined';
 import FileUploadOutlinedIcon from '@mui/icons-material/FileUploadOutlined';
 import LockClockOutlinedIcon from '@mui/icons-material/LockClockOutlined';
@@ -214,38 +210,16 @@ export function Authenticator({ onCopy, onChanged }: AuthenticatorProps): JSX.El
             }}
           >
             {displays.map((display) => (
-              <Box key={display.id} sx={{ position: 'relative' }}>
-                <TotpCard data={display} onCopy={onCopy} />
-                <Box
-                  sx={{
-                    position: 'absolute',
-                    top: 8,
-                    right: 8,
-                    display: 'flex',
-                    gap: 0.25,
-                    bgcolor: 'background.paper',
-                    borderRadius: 1,
-                    opacity: 0.85,
-                  }}
-                >
-                  <Tooltip title="编辑">
-                    <IconButton
-                      size="small"
-                      onClick={() => {
-                        setEditing(entryFromDisplay(display));
-                        setFormOpen(true);
-                      }}
-                    >
-                      <EditOutlinedIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
-                  <Tooltip title="删除">
-                    <IconButton size="small" color="error" onClick={() => setDeleteTarget(entryFromDisplay(display))}>
-                      <DeleteOutlineIcon fontSize="small" />
-                    </IconButton>
-                  </Tooltip>
-                </Box>
-              </Box>
+              <TotpCard
+                key={display.id}
+                data={display}
+                onCopy={onCopy}
+                onEdit={() => {
+                  setEditing(entryFromDisplay(display));
+                  setFormOpen(true);
+                }}
+                onDelete={() => setDeleteTarget(entryFromDisplay(display))}
+              />
             ))}
           </Box>
         )}

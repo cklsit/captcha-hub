@@ -149,7 +149,19 @@ export async function announceClientId(client: ImapFlow, host: string): Promise<
   }
 }
 
-function createClient(credentials: ImapCredentials): ImapFlow {
+/**
+ * Connection timeouts, in milliseconds.
+ *
+ * Bounded on purpose: a server that accepts the TCP connection and then goes
+ * silent would otherwise hold a sync slot open indefinitely, and the user would
+ * see a spinner that never resolves.
+ */
+const CONNECTION_TIMEOUT_MS = 30_000;
+const GREETING_TIMEOUT_MS = 20_000;
+const SOCKET_TIMEOUT_MS = 60_000;
+
+/** Exported for tests: constructing a client performs no I/O. */
+export function createClient(credentials: ImapCredentials): ImapFlow {
   // imapflow switches to XOAUTH2 as soon as an access token is supplied — this
   // is the only mechanism Microsoft still accepts for IMAP.
   const auth =
@@ -157,14 +169,34 @@ function createClient(credentials: ImapCredentials): ImapFlow {
       ? { user: credentials.username, accessToken: credentials.accessToken }
       : { user: credentials.username, pass: credentials.password };
 
-  return new ImapFlow({
+  const client = new ImapFlow({
     host: credentials.host,
     port: credentials.port,
     secure: credentials.secure,
     auth,
     clientInfo: CLIENT_INFO,
+    connectionTimeout: CONNECTION_TIMEOUT_MS,
+    greetingTimeout: GREETING_TIMEOUT_MS,
+    socketTimeout: SOCKET_TIMEOUT_MS,
+    // ImapFlow's logger is intentionally disabled to keep the console clean.
     logger: false,
   });
+
+  /**
+   * A Node EventEmitter throws when it emits `error` with no listener attached.
+   * imapflow emits exactly that on a socket timeout or a dropped connection, so
+   * without this handler a flaky network became an **uncaught exception in the
+   * main process**, which Electron turns into the fatal "A JavaScript error
+   * occurred in the main process" dialog — killing the whole app.
+   *
+   * Observing the event is enough: the in-flight command still rejects, and the
+   * call site reports it as a per-account sync error the user can actually read.
+   */
+  client.on('error', (error: Error) => {
+    console.warn(`[mail-hub] IMAP ${credentials.host}: ${error.message}`);
+  });
+
+  return client;
 }
 
 interface MailboxShape {

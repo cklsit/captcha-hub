@@ -7,8 +7,10 @@ import { defineConfig } from 'vitest/config';
  */
 export default defineConfig({
   test: {
+    // Default to Node; renderer tests opt into jsdom with a
+    // `// @vitest-environment jsdom` docblock so the pure logic stays fast.
     environment: 'node',
-    include: ['tests/**/*.test.ts'],
+    include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
     globals: false,
   },
 });
