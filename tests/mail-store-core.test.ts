@@ -291,3 +291,32 @@ describe('MailStoreCore — 草稿', () => {
     expect(core.listDrafts()).toHaveLength(1);
   });
 });
+
+describe('MailStoreCore — 正文扫描作用域（过滤先于上限）', () => {
+  it('其他目录命中再多，当前目录的正文命中也不会被饿死', () => {
+    // 501 matches in another folder would consume a 500-result cap on their own.
+    const other: Envelope[] = [];
+    for (let i = 0; i < 501; i += 1) {
+      const uid = `o${i}`;
+      core.writeBody('acct-1', 'Other', uid, { text: 'needle', html: '', safeHtml: '' });
+      other.push(envelope({ folderId: 'Other', uid, receivedAt: i, id: `acct-1::Other::${uid}` }));
+    }
+    core.upsertEnvelopes(other);
+
+    const inbox: Envelope[] = [];
+    for (const uid of ['i1', 'i2', 'i3']) {
+      core.writeBody('acct-1', 'INBOX', uid, { text: 'needle', html: '', safeHtml: '' });
+      inbox.push(envelope({ folderId: 'INBOX', uid, receivedAt: 1000, id: `acct-1::INBOX::${uid}` }));
+    }
+    core.upsertEnvelopes(inbox);
+
+    // Baseline: without scoping the cap is eaten entirely by the other folder.
+    const unscoped = core.scanBodies(undefined, 'needle', undefined, { limit: 500 });
+    expect(unscoped).toHaveLength(500);
+    expect(unscoped.every((id) => id.includes('::Other::'))).toBe(true);
+
+    // Scoped scan: the filter runs first, so all 3 current-folder hits survive.
+    const scoped = core.scanBodies({ folderId: 'INBOX' }, 'needle', undefined, { limit: 500 });
+    expect(scoped).toEqual(['acct-1::INBOX::i1', 'acct-1::INBOX::i2', 'acct-1::INBOX::i3']);
+  });
+});

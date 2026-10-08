@@ -477,8 +477,12 @@ export interface MailHubApi {
     remove(id: string): Promise<void>;
     clear(): Promise<void>;
     markAllRead(filter?: MessageFilter): Promise<void>;
-    /** On-demand body scan; returns matching envelope ids (progressive cap). */
-    searchBodies(search: string, limit?: number): Promise<string[]>;
+    /**
+     * On-demand body scan; returns matching envelope ids. `filter` (account /
+     * folder / view flags) is applied BEFORE the result cap, so hits always
+     * belong to the current view and are never starved by other folders.
+     */
+    searchBodies(search: string, filter?: MessageFilter, limit?: number): Promise<string[]>;
   };
   attachments: {
     download(messageId: string, partId: string): Promise<AttachmentDownloadResult>;

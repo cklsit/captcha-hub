@@ -14,8 +14,9 @@ import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import AddIcon from '@mui/icons-material/Add';
 import CloseIcon from '@mui/icons-material/Close';
-import type { ComposePayload, SafeAccount } from '../../shared/types';
+import type { ComposePayload, Draft, SafeAccount } from '../../shared/types';
 import { api } from '../api';
+import { runSaveDraft, runSend } from '../compose-flow';
 import { useToast } from './Toast';
 
 interface ComposeWindowProps {
@@ -24,6 +25,8 @@ interface ComposeWindowProps {
   accounts: SafeAccount[];
   onClose: () => void;
   onSent: () => void;
+  /** Fired after a draft is saved so the drafts box can refresh its list. */
+  onDraftSaved: (draft: Draft) => void;
 }
 
 interface FormState {
@@ -51,6 +54,7 @@ export function ComposeWindow({
   accounts,
   onClose,
   onSent,
+  onDraftSaved,
 }: ComposeWindowProps): JSX.Element {
   const toast = useToast();
   const [form, setForm] = useState<FormState>(EMPTY);
@@ -113,10 +117,9 @@ export function ComposeWindow({
     setBusy(true);
     setError(null);
     try {
-      const result = await api.compose.send(buildPayload());
+      const result = await runSend(buildPayload(), { send: api.compose.send, onSent });
       if (result.ok) {
         toast('已发送', 'success');
-        onSent();
         onClose();
       } else if (result.needsReauth) {
         setError(result.message);
@@ -139,7 +142,10 @@ export function ComposeWindow({
     setBusy(true);
     setError(null);
     try {
-      const draft = await api.compose.saveDraft(buildPayload());
+      const draft = await runSaveDraft(buildPayload(), {
+        saveDraft: api.compose.saveDraft,
+        onDraftSaved,
+      });
       setDraftId(draft.id);
       toast('已存为草稿', 'success');
     } catch (saveError) {

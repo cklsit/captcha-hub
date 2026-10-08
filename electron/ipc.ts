@@ -414,8 +414,13 @@ export function registerIpc(): void {
     const core = getStore();
     for (const envelope of core.listEnvelopes(filter)) core.setFlags(envelope.id, { seen: true });
   });
-  ipcMain.handle('messages:searchBodies', (_event, search: string, limit?: number): string[] =>
-    getStore().scanBodies(undefined, search, undefined, { limit }),
+  ipcMain.handle(
+    'messages:searchBodies',
+    (_event, search: string, filter?: MessageFilter, limit?: number): string[] =>
+      // The view filter is pushed INTO the scan so the result cap applies after
+      // account/folder scoping (a busy folder can no longer starve the current
+      // view of its body-text hits).
+      getStore().scanBodies(filter, search, undefined, { limit }),
   );
 
   // --- attachments ---------------------------------------------------------

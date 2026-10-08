@@ -43,11 +43,21 @@ describe('渲染层接线——草稿箱（PRD P0-9）', () => {
     expect(read('src/components/DraftList.tsx')).toMatch(/onDelete/);
     expect(read('src/App.tsx')).toMatch(/api\.compose\.removeDraft\(draft\.id\)/);
   });
+
+  it('存档后由 App 主动刷新草稿箱（onDraftSaved → loadDrafts）', () => {
+    expect(read('src/components/ComposeWindow.tsx')).toMatch(/onDraftSaved/);
+    const app = read('src/App.tsx');
+    expect(app).toMatch(/onDraftSaved=\{handleDraftSaved\}/);
+    expect(app).toMatch(/handleDraftSaved = useCallback/);
+    // 手动刷新也必须带上草稿
+    expect(app).toMatch(/loadEnvelopes\(\), loadDrafts\(\), reloadSettings\(\)/);
+  });
 });
 
 describe('渲染层接线——正文搜索（PRD P1-1）', () => {
-  it('搜索框接线到既有 messages.searchBodies', () => {
-    expect(read('src/App.tsx')).toMatch(/api\.messages\.searchBodies\(/);
+  it('搜索框接线到既有 messages.searchBodies（带上视图过滤）', () => {
+    const app = read('src/App.tsx');
+    expect(app).toMatch(/api\.messages\.searchBodies\(term, viewFilter, SEARCH_BODY_LIMIT\)/);
   });
 
   it('正文命中结果会在列表中标注「正文匹配」', () => {
@@ -55,11 +65,10 @@ describe('渲染层接线——正文搜索（PRD P1-1）', () => {
     expect(read('src/components/MailListItem.tsx')).toMatch(/正文匹配/);
   });
 
-  it('搜索先出元数据、再渐进追加正文命中（两阶段）', () => {
+  it('搜索先出元数据、再用纯函数合并正文命中（两阶段）', () => {
     const app = read('src/App.tsx');
-    // 元数据先落屏
     expect(app).toMatch(/setEnvelopes\(meta\)/);
-    // 之后才扫描正文并按 id 追加
-    expect(app).toMatch(/setEnvelopes\(\[\.\.\.meta, \.\.\.extras\]/);
+    expect(app).toMatch(/mergeSearchResults\(/);
+    expect(app).toMatch(/setEnvelopes\(merged\.envelopes\)/);
   });
 });

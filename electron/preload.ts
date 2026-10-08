@@ -81,8 +81,8 @@ const api: MailHubApi = {
     clear: (): Promise<void> => ipcRenderer.invoke('messages:clear'),
     markAllRead: (filter?: MessageFilter): Promise<void> =>
       ipcRenderer.invoke('messages:markAllRead', filter),
-    searchBodies: (search: string, limit?: number): Promise<string[]> =>
-      ipcRenderer.invoke('messages:searchBodies', search, limit),
+    searchBodies: (search: string, filter?: MessageFilter, limit?: number): Promise<string[]> =>
+      ipcRenderer.invoke('messages:searchBodies', search, filter, limit),
   },
   attachments: {
     download: (messageId: string, partId: string): Promise<AttachmentDownloadResult> =>

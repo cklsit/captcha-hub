@@ -26,6 +26,7 @@ import type {
 } from '../shared/types';
 import { api } from './api';
 import { draftToComposePayload } from './compose-prefill';
+import { mergeSearchResults } from './search-merge';
 import { Accounts } from './pages/Accounts';
 import { Authenticator } from './pages/Authenticator';
 import { Mail } from './pages/Mail';
@@ -140,20 +141,20 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
         return;
       }
 
-      // Progressive search: metadata hits are already rendered above; now ask
-      // the on-demand body scanner for body-text hits and append the ones the
-      // metadata pass missed (bounded limit + concurrency live in the store).
-      const ids = await api.messages.searchBodies(term, SEARCH_BODY_LIMIT);
-      const metaIds = new Set(meta.map((envelope) => envelope.id));
-      const extraIds = new Set(ids.filter((id) => !metaIds.has(id)));
-      if (extraIds.size === 0) {
+      // Progressive search: metadata hits are already on screen; now ask the
+      // on-demand body scanner, scoped to the CURRENT view so its result cap
+      // cannot be eaten by other folders, then merge the two stages with a
+      // pure, unit-tested helper.
+      const viewFilter = buildFilter(selection, { ...filter, search: undefined });
+      const bodyHitIds = await api.messages.searchBodies(term, viewFilter, SEARCH_BODY_LIMIT);
+      if (bodyHitIds.length === 0) {
         setBodyMatchIds(new Set());
         return;
       }
-      const candidates = await api.messages.list(buildFilter(selection, { ...filter, search: undefined }));
-      const extras = candidates.filter((envelope) => extraIds.has(envelope.id));
-      setBodyMatchIds(new Set(extras.map((envelope) => envelope.id)));
-      setEnvelopes([...meta, ...extras].sort((a, b) => b.receivedAt - a.receivedAt));
+      const candidates = await api.messages.list(viewFilter);
+      const merged = mergeSearchResults(meta, bodyHitIds, candidates, SEARCH_BODY_LIMIT);
+      setBodyMatchIds(merged.bodyMatchIds);
+      setEnvelopes(merged.envelopes);
     } finally {
       setLoading(false);
     }
@@ -405,6 +406,10 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
     [loadDrafts, toast],
   );
 
+  const handleDraftSaved = useCallback(() => {
+    void loadDrafts();
+  }, [loadDrafts]);
+
   const handleReply = useCallback(() => {
     const current = selectedMessage;
     if (!current) return;
@@ -449,8 +454,8 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
   }, [loadAccounts, loadFolders, loadEnvelopes, toast]);
 
   const handleRefresh = useCallback(async () => {
-    await Promise.all([loadAccounts(), loadFolders(), loadEnvelopes(), reloadSettings()]);
-  }, [loadAccounts, loadFolders, loadEnvelopes, reloadSettings]);
+    await Promise.all([loadAccounts(), loadFolders(), loadEnvelopes(), loadDrafts(), reloadSettings()]);
+  }, [loadAccounts, loadFolders, loadEnvelopes, loadDrafts, reloadSettings]);
 
   /* --------------------------------------------------------------- accounts CRUD */
 
@@ -619,6 +624,7 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
           onToggleExternalImages={(allow) => void onUpdateSettings({ allowRemoteImages: allow })}
           onOpenDraft={handleOpenDraft}
           onDeleteDraft={handleDeleteDraft}
+          onDraftSaved={handleDraftSaved}
           onComposeClose={() => setComposeOpen(false)}
           onComposeSent={handleComposeSent}
         />

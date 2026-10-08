@@ -62,6 +62,8 @@ interface MailProps {
   onToggleExternalImages: (allow: boolean) => void;
   onOpenDraft: (draft: Draft) => void;
   onDeleteDraft: (draft: Draft) => void;
+  /** Fired after a draft is persisted so the drafts box can refresh. */
+  onDraftSaved: (draft: Draft) => void;
   onComposeClose: () => void;
   onComposeSent: () => void;
 }
@@ -113,6 +115,7 @@ export function Mail(props: MailProps): JSX.Element {
     onToggleExternalImages,
     onOpenDraft,
     onDeleteDraft,
+    onDraftSaved,
     onComposeClose,
     onComposeSent,
   } = props;
@@ -221,6 +224,7 @@ export function Mail(props: MailProps): JSX.Element {
         accounts={accounts}
         onClose={onComposeClose}
         onSent={onComposeSent}
+        onDraftSaved={onDraftSaved}
       />
     </Box>
   );
