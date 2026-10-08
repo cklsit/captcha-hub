@@ -21,6 +21,8 @@ interface MailListProps {
   loading: boolean;
   syncing: boolean;
   highlightIds: Set<string>;
+  /** Ids that only matched through the on-demand body scan. */
+  bodyMatchIds: Set<string>;
   filter: MessageFilter;
   onFilterChange: (patch: Partial<MessageFilter>) => void;
   onSelect: (envelope: Envelope) => void;
@@ -39,6 +41,7 @@ export function MailList({
   loading,
   syncing,
   highlightIds,
+  bodyMatchIds,
   filter,
   onFilterChange,
   onSelect,
@@ -130,6 +133,7 @@ export function MailList({
               folderName={foldersById[envelope.folderId] ?? ''}
               selected={envelope.id === selectedId}
               highlighted={highlightIds.has(envelope.id)}
+              bodyMatch={bodyMatchIds.has(envelope.id)}
               onSelect={onSelect}
               onCopy={onCopy}
             />

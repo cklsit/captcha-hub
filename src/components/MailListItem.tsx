@@ -15,6 +15,8 @@ interface MailListItemProps {
   selected: boolean;
   /** Newly-arrived highlight pulse. */
   highlighted: boolean;
+  /** True when this row only matched because of a body-text search hit. */
+  bodyMatch: boolean;
   onSelect: (envelope: Envelope) => void;
   onCopy: (value: string) => void;
 }
@@ -26,6 +28,7 @@ export function MailListItem({
   folderName,
   selected,
   highlighted,
+  bodyMatch,
   onSelect,
   onCopy,
 }: MailListItemProps): JSX.Element {
@@ -87,6 +90,7 @@ export function MailListItem({
         {folderName ? (
           <Chip size="small" variant="outlined" label={folderName} sx={{ height: 18, fontSize: 10 }} />
         ) : null}
+        {bodyMatch ? <Chip size="small" label="正文匹配" sx={{ height: 18, fontSize: 10 }} /> : null}
         {envelope.highlight ? (
           <Chip
             size="small"

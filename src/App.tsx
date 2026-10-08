@@ -17,6 +17,7 @@ import type {
   AppSettings,
   ComposePayload,
   ConnectionTestResult,
+  Draft,
   Envelope,
   Folder,
   MailMessage,
@@ -24,6 +25,7 @@ import type {
   SafeAccount,
 } from '../shared/types';
 import { api } from './api';
+import { draftToComposePayload } from './compose-prefill';
 import { Accounts } from './pages/Accounts';
 import { Authenticator } from './pages/Authenticator';
 import { Mail } from './pages/Mail';
@@ -34,9 +36,12 @@ import { ToastProvider, useToast } from './components/Toast';
 import { DEFAULT_APP_SETTINGS } from './constants';
 import { formatRelative } from './format';
 import { buildTheme } from './theme';
-import type { MailSelection, ViewKey } from './types';
+import { DRAFTS_FOLDER, type MailSelection, type ViewKey } from './types';
 
 const HIGHLIGHT_DURATION_MS = 6000;
+
+/** Upper bound on body-text search hits fetched from the on-demand scanner. */
+const SEARCH_BODY_LIMIT = 500;
 
 const VIEW_TITLES: Record<ViewKey, string> = {
   mail: '邮件',
@@ -65,6 +70,9 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
   const [presets, setPresets] = useState<AccountPreset[]>([]);
   const [foldersByAccount, setFoldersByAccount] = useState<Record<string, Folder[]>>({});
   const [envelopes, setEnvelopes] = useState<Envelope[]>([]);
+  const [drafts, setDrafts] = useState<Draft[]>([]);
+  const [draftCounts, setDraftCounts] = useState<Record<string, number>>({});
+  const [bodyMatchIds, setBodyMatchIds] = useState<Set<string>>(() => new Set());
   const [selection, setSelection] = useState<MailSelection>(EMPTY_SELECTION);
   const [filter, setFilter] = useState<MessageFilter>({});
   const [selectedMessage, setSelectedMessage] = useState<MailMessage | null>(null);
@@ -120,13 +128,44 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
   }, []);
 
   const loadEnvelopes = useCallback(async () => {
+    if (selection.folderId === DRAFTS_FOLDER) return;
     setLoading(true);
     try {
-      setEnvelopes(await api.messages.list(buildFilter(selection, filter)));
+      const meta = await api.messages.list(buildFilter(selection, filter));
+      setEnvelopes(meta);
+
+      const term = (filter.search ?? '').trim();
+      if (!term) {
+        setBodyMatchIds(new Set());
+        return;
+      }
+
+      // Progressive search: metadata hits are already rendered above; now ask
+      // the on-demand body scanner for body-text hits and append the ones the
+      // metadata pass missed (bounded limit + concurrency live in the store).
+      const ids = await api.messages.searchBodies(term, SEARCH_BODY_LIMIT);
+      const metaIds = new Set(meta.map((envelope) => envelope.id));
+      const extraIds = new Set(ids.filter((id) => !metaIds.has(id)));
+      if (extraIds.size === 0) {
+        setBodyMatchIds(new Set());
+        return;
+      }
+      const candidates = await api.messages.list(buildFilter(selection, { ...filter, search: undefined }));
+      const extras = candidates.filter((envelope) => extraIds.has(envelope.id));
+      setBodyMatchIds(new Set(extras.map((envelope) => envelope.id)));
+      setEnvelopes([...meta, ...extras].sort((a, b) => b.receivedAt - a.receivedAt));
     } finally {
       setLoading(false);
     }
   }, [selection, filter]);
+
+  const loadDrafts = useCallback(async () => {
+    const all = await api.compose.listDrafts();
+    setDrafts(all);
+    const counts: Record<string, number> = {};
+    for (const draft of all) counts[draft.accountId] = (counts[draft.accountId] ?? 0) + 1;
+    setDraftCounts(counts);
+  }, []);
 
   const refreshTotpCount = useCallback(async () => {
     try {
@@ -161,15 +200,20 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
       }
     })();
     void refreshTotpCount();
+    void loadDrafts();
 
     return () => {
       cancelled = true;
     };
-  }, [refreshTotpCount]);
+  }, [refreshTotpCount, loadDrafts]);
 
   useEffect(() => {
     void loadEnvelopes();
   }, [loadEnvelopes]);
+
+  useEffect(() => {
+    if (selection.folderId === DRAFTS_FOLDER) void loadDrafts();
+  }, [selection, loadDrafts]);
 
   useEffect(() => {
     const offNew = api.on.newMessages((incoming) => {
@@ -207,6 +251,12 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
   const handleSelectFolder = useCallback((accountId: string, folderId: string) => {
     setSelection({ accountId, folderId });
     setSelectedMessage(null);
+  }, []);
+
+  const handleSelectDrafts = useCallback((accountId: string) => {
+    setSelection({ accountId, folderId: DRAFTS_FOLDER });
+    setSelectedMessage(null);
+    setLoading(false);
   }, []);
 
   /* ---------------------------------------------------------------- messages */
@@ -333,6 +383,28 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
     setComposeOpen(true);
   }, []);
 
+  const handleOpenDraft = useCallback(
+    (draft: Draft) => {
+      openCompose(draftToComposePayload(draft));
+    },
+    [openCompose],
+  );
+
+  const handleDeleteDraft = useCallback(
+    (draft: Draft) => {
+      void (async () => {
+        try {
+          await api.compose.removeDraft(draft.id);
+          await loadDrafts();
+          toast('草稿已删除', 'success');
+        } catch (error) {
+          toast(error instanceof Error ? error.message : String(error), 'error');
+        }
+      })();
+    },
+    [loadDrafts, toast],
+  );
+
   const handleReply = useCallback(() => {
     const current = selectedMessage;
     if (!current) return;
@@ -357,7 +429,8 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
     void loadEnvelopes();
     void loadFolders();
     void loadAccounts();
-  }, [loadEnvelopes, loadFolders, loadAccounts]);
+    void loadDrafts();
+  }, [loadEnvelopes, loadFolders, loadAccounts, loadDrafts]);
 
   /* ------------------------------------------------------------------ sync */
 
@@ -460,6 +533,16 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
     [selectedMessage, foldersByAccount],
   );
 
+  const draftsMode = selection.folderId === DRAFTS_FOLDER;
+  const draftAccountName = selection.accountId !== 'all' ? accountsById[selection.accountId] : undefined;
+  const visibleDrafts = useMemo(
+    () =>
+      selection.accountId === 'all'
+        ? drafts
+        : drafts.filter((draft) => draft.accountId === selection.accountId),
+    [drafts, selection.accountId],
+  );
+
   const unreadCount = useMemo(
     () =>
       Object.values(foldersByAccount)
@@ -498,15 +581,20 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
         <Mail
           accounts={accounts}
           foldersByAccount={foldersByAccount}
+          draftCounts={draftCounts}
           envelopes={envelopes}
           accountsById={accountsById}
           foldersById={foldersById}
           selection={selection}
           selectedMessage={selectedMessage}
           messageFolders={messageFolders}
+          draftsMode={draftsMode}
+          drafts={visibleDrafts}
+          draftAccountName={draftAccountName}
           loading={loading}
           syncing={syncing}
           highlightIds={highlightIds}
+          bodyMatchIds={bodyMatchIds}
           filter={filter}
           bodyRenderMode={settings.bodyRenderMode}
           allowRemoteImages={settings.allowRemoteImages}
@@ -516,6 +604,7 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
           onSelectAll={handleSelectAll}
           onSelectAccount={handleSelectAccount}
           onSelectFolder={handleSelectFolder}
+          onSelectDrafts={handleSelectDrafts}
           onManageAccounts={() => setAccountsOpen(true)}
           onFilterChange={(patch) => setFilter((prev) => ({ ...prev, ...patch }))}
           onSelectEnvelope={handleSelectEnvelope}
@@ -528,6 +617,8 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
           onMove={handleMove}
           onDownloadAttachment={handleDownloadAttachment}
           onToggleExternalImages={(allow) => void onUpdateSettings({ allowRemoteImages: allow })}
+          onOpenDraft={handleOpenDraft}
+          onDeleteDraft={handleDeleteDraft}
           onComposeClose={() => setComposeOpen(false)}
           onComposeSent={handleComposeSent}
         />

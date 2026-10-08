@@ -25,6 +25,9 @@ import { envelopeKey } from './dedupe';
 /** Per-folder index cap; envelopes are tiny so this is intentionally generous. */
 export const MAX_ENVELOPES_PER_FOLDER = 20000;
 
+/** Windows reserves these device names regardless of extension (`CON`, `NUL.txt`…). */
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i;
+
 /** Sanitised body shape persisted on disk. */
 export interface MailBody {
   text: string;
@@ -73,12 +76,20 @@ export class MailStoreCore {
 
   /** Strips separators / control chars from a value used as a path segment. */
   safeSegment(segment: string): string {
-    const cleaned = String(segment ?? '')
+    let cleaned = String(segment ?? '')
       // eslint-disable-next-line no-control-regex
       .replace(/[/\\:?*"<>|\u0000-\u001f]/g, '_')
       .replace(/\.{2,}/g, '_')
       .trim();
-    return cleaned.length > 0 ? cleaned.slice(0, 180) : '_';
+    // Windows silently drops trailing dots / spaces, which would make two
+    // distinct segments collide on disk — strip them explicitly.
+    cleaned = cleaned.replace(/[. ]+$/g, '');
+    if (cleaned.length === 0) return '_';
+    cleaned = cleaned.slice(0, 180);
+    // Windows device names (CON / NUL / COM1…) cannot be used as a file or
+    // directory name even with an extension. Escape them with a leading `_`.
+    if (WINDOWS_RESERVED.test(cleaned)) cleaned = `_${cleaned}`;
+    return cleaned;
   }
 
   private indexPath(): string {
@@ -112,8 +123,18 @@ export class MailStoreCore {
   private writeJsonAtomic(filePath: string, value: unknown): void {
     this.ensureDir(filePath);
     const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-    fs.writeFileSync(tmp, JSON.stringify(value), 'utf8');
-    fs.renameSync(tmp, filePath);
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(value), 'utf8');
+      fs.renameSync(tmp, filePath);
+    } finally {
+      // On success the rename consumed `tmp`; on failure this removes the
+      // half-written temp file so it never leaks next to the real target.
+      try {
+        if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+      } catch {
+        /* best effort cleanup */
+      }
+    }
   }
 
   private readJson<T>(filePath: string, fallback: T): T {
@@ -378,6 +399,13 @@ export class MailStoreCore {
    * On-demand body scan for a substring (case-insensitive). Bodies are read
    * lazily, in batches, and the result set is capped — this is intentionally
    * NOT a full-text index (the app does not promise index-grade immediacy).
+   *
+   * The scan is SYNCHRONOUS: bodies are read with `readFileSync` from an
+   * in-memory envelope index. This is a deliberate, documented choice — the
+   * architecture's "并发 8" figure describes an aspiration, not the shipped
+   * behaviour (see `docs/…` / `.workbuddy/.../02-architecture-increment.md`
+   * §10). Async concurrency would change this method's signature and the
+   * verified IPC contract for a mailbox size this release does not target.
    */
   scanBodies(
     filter: MessageFilter | undefined,

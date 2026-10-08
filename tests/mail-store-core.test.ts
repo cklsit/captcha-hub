@@ -130,6 +130,52 @@ describe('MailStoreCore — 正文文件', () => {
     expect(matched).toEqual(['acct-1::INBOX::1']);
     expect(batches.flat()).toEqual(['acct-1::INBOX::1']);
   });
+
+  it('scanBodies 在空关键词时短路返回空数组', () => {
+    core.upsertEnvelopes([envelope({ uid: '1' })]);
+    core.writeBody('acct-1', 'INBOX', '1', { text: 'anything', html: '', safeHtml: '' });
+    expect(core.scanBodies(undefined, '   ')).toEqual([]);
+  });
+});
+
+describe('MailStoreCore — 路径安全化 (safeSegment)', () => {
+  it('转义 Windows 保留设备名（含带扩展名形式）', () => {
+    expect(core.safeSegment('CON')).toBe('_CON');
+    expect(core.safeSegment('nul')).toBe('_nul');
+    expect(core.safeSegment('AUX')).toBe('_AUX');
+    expect(core.safeSegment('PRN')).toBe('_PRN');
+    expect(core.safeSegment('COM1')).toBe('_COM1');
+    expect(core.safeSegment('LPT9')).toBe('_LPT9');
+    expect(core.safeSegment('CON.txt')).toBe('_CON.txt');
+  });
+
+  it('去掉结尾的点与空格，并对空值兜底', () => {
+    expect(core.safeSegment('foo.')).toBe('foo');
+    expect(core.safeSegment('foo   ')).toBe('foo');
+    expect(core.safeSegment('..')).toBe('_');
+    expect(core.safeSegment('   ')).toBe('_');
+    expect(core.safeSegment('')).toBe('_');
+  });
+
+  it('替换路径分隔符与控制字符', () => {
+    expect(core.safeSegment('a/b\\c')).toBe('a_b_c');
+    expect(core.safeSegment('x:y?z*')).toBe('x_y_z_');
+  });
+
+  it('保留名不会真的写到保留设备路径（防穿越复核）', () => {
+    core.writeBody('CON', 'INBOX', '1', { text: 'x', html: '', safeHtml: '' });
+    expect(fs.existsSync(path.join(rootDir, 'accounts', '_CON', 'INBOX', '1.json'))).toBe(true);
+  });
+});
+
+describe('MailStoreCore — 原子写', () => {
+  it('写入失败时不残留 .tmp-* 临时文件', () => {
+    // Make the rename target a directory so `renameSync` fails.
+    fs.mkdirSync(path.join(rootDir, 'index.json'));
+    expect(() => core.upsertEnvelopes([envelope()])).toThrow();
+    const leftovers = fs.readdirSync(rootDir).filter((name) => name.includes('.tmp-'));
+    expect(leftovers).toEqual([]);
+  });
 });
 
 describe('MailStoreCore — 文件夹与计数', () => {
@@ -184,5 +230,64 @@ describe('MailStoreCore — 草稿', () => {
     expect(core.listDrafts('acct-1')[0].subject).toBe('hi again');
     core.deleteDraft(draft.id);
     expect(core.listDrafts('acct-1')).toHaveLength(0);
+  });
+
+  it('草稿全字段往返，可供渲染层续写预填', () => {
+    const draft = core.saveDraft({
+      accountId: 'acct-1',
+      mode: 'reply',
+      inReplyTo: '<m1@example.com>',
+      to: 'a@example.com',
+      cc: 'b@example.com',
+      subject: 'Re: hi',
+      bodyText: 'quoted body',
+      bodyHtml: '<p>quoted body</p>',
+      attachments: ['C:\\docs\\file.pdf'],
+    });
+    const listed = core.listDrafts('acct-1');
+    expect(listed).toHaveLength(1);
+    expect(listed[0]).toMatchObject({
+      id: draft.id,
+      accountId: 'acct-1',
+      mode: 'reply',
+      inReplyTo: '<m1@example.com>',
+      to: 'a@example.com',
+      cc: 'b@example.com',
+      subject: 'Re: hi',
+      bodyText: 'quoted body',
+      bodyHtml: '<p>quoted body</p>',
+      attachments: ['C:\\docs\\file.pdf'],
+    });
+    expect(listed[0].updatedAt).toBeGreaterThan(0);
+  });
+
+  it('listDrafts 可按账户过滤，删除后不再出现', () => {
+    const first = core.saveDraft({
+      accountId: 'acct-1',
+      mode: 'new',
+      inReplyTo: '',
+      to: 'a@example.com',
+      cc: '',
+      subject: 'one',
+      bodyText: '',
+      bodyHtml: '',
+      attachments: [],
+    });
+    core.saveDraft({
+      accountId: 'acct-2',
+      mode: 'new',
+      inReplyTo: '',
+      to: 'b@example.com',
+      cc: '',
+      subject: 'two',
+      bodyText: '',
+      bodyHtml: '',
+      attachments: [],
+    });
+    expect(core.listDrafts('acct-1')).toHaveLength(1);
+    expect(core.listDrafts()).toHaveLength(2);
+    core.deleteDraft(first.id);
+    expect(core.listDrafts('acct-1')).toHaveLength(0);
+    expect(core.listDrafts()).toHaveLength(1);
   });
 });

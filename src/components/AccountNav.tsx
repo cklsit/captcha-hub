@@ -6,21 +6,25 @@ import IconButton from '@mui/material/IconButton';
 import Tooltip from '@mui/material/Tooltip';
 import Typography from '@mui/material/Typography';
 import AddIcon from '@mui/icons-material/Add';
+import DraftsOutlinedIcon from '@mui/icons-material/DraftsOutlined';
 import ExpandLessIcon from '@mui/icons-material/ExpandLess';
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import MailOutlineIcon from '@mui/icons-material/MailOutline';
 import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined';
 import type { Folder, SafeAccount } from '../../shared/types';
-import type { MailSelection } from '../types';
+import { DRAFTS_FOLDER, type MailSelection } from '../types';
 import { FolderTree } from './FolderTree';
 
 interface AccountNavProps {
   accounts: SafeAccount[];
   foldersByAccount: Record<string, Folder[]>;
+  /** Number of locally-saved drafts per account id. */
+  draftCounts: Record<string, number>;
   selection: MailSelection;
   onSelectAll: () => void;
   onSelectFolder: (accountId: string, folderId: string) => void;
   onSelectAccount: (accountId: string) => void;
+  onSelectDrafts: (accountId: string) => void;
   onManage: () => void;
 }
 
@@ -28,10 +32,12 @@ interface AccountNavProps {
 export function AccountNav({
   accounts,
   foldersByAccount,
+  draftCounts,
   selection,
   onSelectAll,
   onSelectFolder,
   onSelectAccount,
+  onSelectDrafts,
   onManage,
 }: AccountNavProps): JSX.Element {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
@@ -124,9 +130,40 @@ export function AccountNav({
               </Box>
 
               <Collapse in={!isCollapsed} timeout="auto" unmountOnExit>
+                {(() => {
+                  const draftsActive = active && selection.folderId === DRAFTS_FOLDER;
+                  const draftCount = draftCounts[account.id] ?? 0;
+                  return (
+                    <Box
+                      onClick={() => onSelectDrafts(account.id)}
+                      sx={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 1,
+                        pl: 4,
+                        pr: 2,
+                        py: 0.5,
+                        cursor: 'pointer',
+                        borderRadius: 1,
+                        bgcolor: draftsActive ? 'action.selected' : 'transparent',
+                        '&:hover': { bgcolor: 'action.hover' },
+                      }}
+                    >
+                      <Box sx={{ color: draftsActive ? 'primary.main' : 'text.secondary', display: 'flex' }}>
+                        <DraftsOutlinedIcon fontSize="small" />
+                      </Box>
+                      <Typography variant="body2" noWrap sx={{ minWidth: 0, flex: 1, fontWeight: draftsActive ? 600 : 400 }}>
+                        草稿箱
+                      </Typography>
+                      {draftCount > 0 ? (
+                        <Chip size="small" variant="outlined" label={draftCount} sx={{ height: 16, fontSize: 10 }} />
+                      ) : null}
+                    </Box>
+                  );
+                })()}
                 <FolderTree
                   folders={folders}
-                  selectedFolderId={active && selection.folderId !== 'all' ? selection.folderId : null}
+                  selectedFolderId={active && selection.folderId !== 'all' && selection.folderId !== DRAFTS_FOLDER ? selection.folderId : null}
                   onSelect={(folderId) => onSelectFolder(account.id, folderId)}
                 />
               </Collapse>
