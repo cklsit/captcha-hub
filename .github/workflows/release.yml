@@ -36,7 +36,7 @@ jobs:
       - name: 上传安装包
         uses: actions/upload-artifact@v7
         with:
-          name: captcha-hub-windows
+          name: mail-hub-windows
           path: |
             release/*.exe
             release/*.blockmap
