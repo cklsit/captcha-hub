@@ -9,7 +9,8 @@ import { listDrafts, removeDraft, saveDraft, buildForwardPrefill, buildReplyPref
 import { sendMail, verifySmtp } from './smtp';
 import { generateTotp } from './totp';
 import { parseOtpAuthUri } from './otpauth';
-import { cancelLogin, MS_DEFAULT_TENANT, pollLogin, requestDeviceCode } from './ms-oauth';
+import { MS_DEFAULT_TENANT } from './ms-oauth';
+import { cancelLogin, msLoginPoll, msLoginStart } from './ms-login';
 import { bgraToRgba, decodeQrPixels } from './qr';
 import { getSyncStatus, syncAll } from './ingest';
 import { getStore } from './mail-service';
@@ -373,11 +374,13 @@ export function registerIpc(): void {
   ipcMain.handle(
     'accounts:msLoginStart',
     (_event, email: EmailSourceInput): Promise<MsLoginStartResult> =>
-      requestDeviceCode(email.clientId ?? '', email.tenant ?? MS_DEFAULT_TENANT),
+      // The address, when the user already typed one, is passed along as a
+      // sign-in hint so Microsoft pre-selects the right account.
+      msLoginStart(email.clientId ?? '', email.tenant ?? MS_DEFAULT_TENANT, email.username ?? ''),
   );
   ipcMain.handle(
     'accounts:msLoginPoll',
-    (_event, flowId: string): Promise<MsLoginPollResult> => pollLogin(flowId),
+    (_event, flowId: string): Promise<MsLoginPollResult> => msLoginPoll(flowId),
   );
   ipcMain.handle('accounts:msLoginCancel', (_event, flowId: string): void => {
     cancelLogin(flowId);

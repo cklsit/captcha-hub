@@ -423,17 +423,36 @@ export interface TotpEntryInput {
   totp?: Partial<TotpSecret> | null;
 }
 
-/** Step 1 of the Microsoft device-code flow, shown to the user as instructions. */
+/**
+ * How a Microsoft sign-in is carried out.
+ *
+ * `redirect` is the one-click path — authorization code + PKCE over a loopback
+ * redirect: the browser opens Microsoft's own page and the code comes straight
+ * back to the app, so nothing is typed here.
+ *
+ * `device` is the fallback — the user retypes a short code on Microsoft's page.
+ *
+ * A flow may switch from `redirect` to `device` mid-flight (browser never came
+ * back, or the Azure app has no `http://localhost` reply address), so callers
+ * must always render from the *current* mode rather than the one they started.
+ */
+export type MsLoginMode = 'redirect' | 'device';
+
+/** Step 1 of the Microsoft sign-in, shown to the user as instructions. */
 export interface MsLoginStartResult {
   ok: boolean;
   message: string;
   flowId?: string;
-  /** Short code the user types at `verificationUri`. */
-  userCode?: string;
+  mode?: MsLoginMode;
+  /** URL to open in the browser (Microsoft's sign-in page). */
   verificationUri?: string;
+  /** Device mode only: the code the user types at `verificationUri`. */
+  userCode?: string;
   expiresInSec?: number;
   /** How often the renderer should call `msLoginPoll`. */
   intervalSec?: number;
+  /** Set when the redirect path was unavailable and device code is in use. */
+  fallbackReason?: string;
 }
 
 export type MsLoginStatus = 'pending' | 'slow_down' | 'success' | 'error';
@@ -441,6 +460,13 @@ export type MsLoginStatus = 'pending' | 'slow_down' | 'success' | 'error';
 export interface MsLoginPollResult {
   status: MsLoginStatus;
   message: string;
+  /** Current mode; may differ from the one `msLoginStart` returned. */
+  mode?: MsLoginMode;
+  /** Signed-in address, present once the login succeeded. */
+  account?: string;
+  /** Device mode only: echoed back so the UI can keep showing the code. */
+  userCode?: string;
+  verificationUri?: string;
 }
 
 /** The complete, typed surface exposed to the renderer through the preload bridge. */

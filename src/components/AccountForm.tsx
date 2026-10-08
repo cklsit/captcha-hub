@@ -21,6 +21,7 @@ import type {
   AccountPreset,
   ConnectionTestResult,
   EmailAuthType,
+  MsLoginMode,
   MsLoginStatus,
   SafeAccount,
 } from '../../shared/types';
@@ -78,13 +79,24 @@ const EMPTY_SMTP: SmtpState = {
   authType: 'password',
 };
 
+/**
+ * Microsoft serves IMAP from this one hostname for personal accounts *and* for
+ * work/school tenants. The user has no reason to know it, so choosing the
+ * Microsoft sign-in method fills it in for them.
+ */
+const MICROSOFT_IMAP_HOST = 'outlook.office365.com';
+
 interface OAuthFlowState {
   flowId: string;
+  /** Live mode — starts as `redirect` and may downgrade to `device`. */
+  mode: MsLoginMode;
   userCode: string;
   verificationUri: string;
   intervalSec: number;
   status: MsLoginStatus;
   message: string;
+  /** Why the quicker redirect path was not used, when that happened. */
+  fallbackReason: string;
 }
 
 /** Create / edit dialog for a mail account (IMAP + SMTP + signature). */
@@ -188,16 +200,22 @@ export function AccountForm({
   function validate(): string | null {
     if (!name.trim()) return '请填写账户名称。';
     if (!imap.host) return '请填写 IMAP 服务器地址。';
-    if (!imap.username) return '请填写登录用户名（通常是邮箱地址）。';
+
     if (imap.authType === 'oauth2') {
       if (!imap.clientId.trim()) return '请填写 Application (client) ID。';
       const alreadyAuthorised = Boolean(initial?.imap.hasRefreshToken);
       const justAuthorised = oauthFlow?.status === 'success';
       if (!alreadyAuthorised && !justAuthorised) {
-        return '请先点击「使用 Microsoft 账户登录」并完成浏览器中的授权。';
+        return '请先点击「使用 Microsoft 账户登录」并完成浏览器中的登录。';
       }
-    } else if (!imap.password && !initial?.imap.hasPassword) {
-      return '请填写邮箱授权码 / 密码。';
+      // The address is filled in from Microsoft's own answer, so the field is
+      // only a problem when the sign-in did not report one.
+      if (!imap.username.trim()) {
+        return '未能从 Microsoft 获取邮箱地址，请手动填写登录用户名。';
+      }
+    } else {
+      if (!imap.username) return '请填写登录用户名（通常是邮箱地址）。';
+      if (!imap.password && !initial?.imap.hasPassword) return '请填写邮箱授权码 / 密码。';
     }
     return null;
   }
@@ -260,13 +278,32 @@ export function AccountForm({
           const result = await api.accounts.msLoginPoll(flowId);
           if (cancelled) return;
           setOauthFlow((prev) =>
-            prev && prev.flowId === flowId ? { ...prev, status: result.status, message: result.message } : prev,
+            prev && prev.flowId === flowId
+              ? {
+                  ...prev,
+                  status: result.status,
+                  message: result.message,
+                  // The flow may downgrade from redirect to device code
+                  // mid-flight; always render whatever it is *now*.
+                  mode: result.mode ?? prev.mode,
+                  userCode: result.userCode ?? prev.userCode,
+                  verificationUri: result.verificationUri ?? prev.verificationUri,
+                }
+              : prev,
           );
+
+          // Microsoft tells us who signed in, so the address never has to be
+          // typed by hand — only fill fields the user left untouched.
+          if (result.status === 'success' && result.account) {
+            const account = result.account;
+            setImap((prev) => (prev.username.trim() ? prev : { ...prev, username: account }));
+            setName((prev) => (prev.trim() ? prev : account));
+          }
         } catch {
           /* transient — the next tick retries */
         }
       })();
-    }, Math.max(5, flowIntervalSec) * 1000);
+    }, Math.max(2, flowIntervalSec) * 1000);
 
     return () => {
       cancelled = true;
@@ -287,12 +324,20 @@ export function AccountForm({
       }
       setOauthFlow({
         flowId: result.flowId,
+        mode: result.mode ?? 'device',
         userCode: result.userCode ?? '',
         verificationUri: result.verificationUri ?? '',
         intervalSec: result.intervalSec ?? 5,
         status: 'pending',
         message: result.message,
+        fallbackReason: result.fallbackReason ?? '',
       });
+
+      // The whole point of the redirect flow: land the user on Microsoft's own
+      // sign-in page, with nothing to look up and no code to copy.
+      if (result.mode === 'redirect' && result.verificationUri) {
+        void api.system.openExternal(result.verificationUri);
+      }
     } catch (loginError) {
       setOauthError(loginError instanceof Error ? loginError.message : String(loginError));
     } finally {
@@ -354,7 +399,24 @@ export function AccountForm({
             select
             label="认证方式"
             value={imap.authType}
-            onChange={(event) => setImap({ ...imap, authType: event.target.value as EmailAuthType })}
+            onChange={(event) => {
+              const authType = event.target.value as EmailAuthType;
+              setImap((prev) => {
+                const next = { ...prev, authType };
+                if (authType === 'oauth2') {
+                  // Microsoft is the only provider this app signs into with
+                  // OAuth, and it only serves IMAP from one endpoint — filling
+                  // it in here means the user never has to know the hostname.
+                  next.host = MICROSOFT_IMAP_HOST;
+                  next.port = 993;
+                  next.secure = true;
+                }
+                return next;
+              });
+              // A previous authorisation belongs to the previous settings.
+              setOauthFlow(null);
+              setOauthError(null);
+            }}
             fullWidth
           >
             <MenuItem value="password">密码 / 授权码（QQ、163、Gmail 等）</MenuItem>
@@ -380,9 +442,16 @@ export function AccountForm({
             label="使用 SSL/TLS"
           />
           <TextField
-            label="用户名 / 邮箱地址"
+            label={
+              imap.authType === 'oauth2' ? '邮箱地址（留空即可）' : '用户名 / 邮箱地址'
+            }
             value={imap.username}
             onChange={(event) => setImap({ ...imap, username: event.target.value.trim() })}
+            helperText={
+              imap.authType === 'oauth2'
+                ? '无需手动填写：完成 Microsoft 登录后会自动填入你登录所用的邮箱地址。'
+                : undefined
+            }
             fullWidth
           />
           {imap.authType === 'password' ? (
@@ -397,13 +466,15 @@ export function AccountForm({
           ) : (
             <Stack spacing={2}>
               <Alert severity="info">
-                微软已停用 IMAP 的密码登录（服务器返回 LOGINDISABLED），必须走 OAuth 2.0。
-                请先注册一个免费 Azure 应用，把它的 Application (client) ID 填在下面。
+                微软已停用 IMAP 的密码登录（服务器直接返回 LOGINDISABLED），只能用 Microsoft 账户登录。
+                先注册一个免费 Azure 应用，把 Application (client) ID 填在下面；之后点一次按钮就能完成授权，
+                <strong>邮箱地址与服务地址都会自动填好</strong>。
               </Alert>
               <TextField
                 label="Application (client) ID"
                 value={imap.clientId}
                 onChange={(event) => setImap({ ...imap, clientId: event.target.value.trim() })}
+                helperText="在 portal.azure.com → Microsoft Entra ID → 应用注册 中创建，并开启「允许公共客户端流」。"
                 fullWidth
               />
               <TextField
@@ -413,27 +484,52 @@ export function AccountForm({
                 helperText="个人账户填 consumers，工作/学校账户填 organizations；不确定就保持 common。"
                 fullWidth
               />
-              <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
-                <Button
-                  variant="outlined"
-                  startIcon={<LoginOutlinedIcon />}
-                  disabled={oauthBusy || !imap.clientId.trim()}
-                  onClick={() => void startMicrosoftLogin()}
-                >
-                  {oauthBusy ? '正在获取设备码…' : oauthFlow ? '重新登录' : '使用 Microsoft 账户登录'}
-                </Button>
-                {initial?.imap.hasRefreshToken && !oauthFlow ? (
-                  <Typography variant="caption" color="text.secondary">
-                    该账户已完成授权，未重新登录则沿用现有令牌。
-                  </Typography>
-                ) : null}
-              </Box>
+
+              <Button
+                variant="contained"
+                startIcon={<LoginOutlinedIcon />}
+                disabled={oauthBusy || !imap.clientId.trim()}
+                onClick={() => void startMicrosoftLogin()}
+              >
+                {oauthBusy ? '正在连接 Microsoft…' : oauthFlow ? '重新登录' : '使用 Microsoft 账户登录'}
+              </Button>
+
+              {initial?.imap.hasRefreshToken && !oauthFlow ? (
+                <Typography variant="caption" color="text.secondary">
+                  该账户已完成授权，不重新登录则沿用现有令牌。
+                </Typography>
+              ) : null}
+
+              {oauthFlow?.fallbackReason && oauthFlow.status !== 'success' ? (
+                <Alert severity="warning">
+                  {oauthFlow.fallbackReason}
+                  <br />
+                  在 Azure 应用的「身份验证 → 添加平台 → 移动和桌面应用程序」中加上
+                  <code> http://localhost </code>
+                  后，即可改成免输码的一键登录。
+                </Alert>
+              ) : null}
+
               {oauthFlow ? (
-                <Alert severity={oauthFlow.status === 'success' ? 'success' : oauthFlow.status === 'error' ? 'error' : 'info'}>
+                <Alert
+                  severity={
+                    oauthFlow.status === 'success'
+                      ? 'success'
+                      : oauthFlow.status === 'error'
+                        ? 'error'
+                        : 'info'
+                  }
+                >
                   {oauthFlow.status === 'success' ? (
-                    <>登录成功，令牌已加密保存在本机。点击「保存」即可创建账户。</>
+                    <>登录成功，邮箱地址已自动填入，令牌已加密保存在本机。点击「保存」即可。</>
                   ) : oauthFlow.status === 'error' ? (
                     oauthFlow.message
+                  ) : oauthFlow.mode === 'redirect' ? (
+                    <>
+                      已在浏览器中打开 Microsoft 登录页，请在那里登录你的 Microsoft 账户。
+                      <br />
+                      登录完成后这里会自动继续，无需再回到此对话框操作。
+                    </>
                   ) : (
                     <>
                       在浏览器打开授权页面，输入代码{' '}
@@ -442,6 +538,7 @@ export function AccountForm({
                       {oauthFlow.message}
                     </>
                   )}
+
                   {oauthFlow.status !== 'error' && oauthFlow.verificationUri ? (
                     <Box sx={{ mt: 1 }}>
                       <Button
@@ -449,12 +546,13 @@ export function AccountForm({
                         startIcon={<OpenInNewOutlinedIcon />}
                         onClick={() => void api.system.openExternal(oauthFlow.verificationUri ?? '')}
                       >
-                        打开授权页面
+                        {oauthFlow.mode === 'redirect' ? '重新打开登录页' : '打开授权页面'}
                       </Button>
                     </Box>
                   ) : null}
                 </Alert>
               ) : null}
+
               {oauthError ? <Alert severity="error">{oauthError}</Alert> : null}
             </Stack>
           )}

@@ -1,7 +1,8 @@
 import Store from 'electron-store';
 import { randomUUID } from 'node:crypto';
 import { decryptString, encryptString } from './crypto';
-import { getPendingTokens, MS_DEFAULT_TENANT } from './ms-oauth';
+import { MS_DEFAULT_TENANT } from './ms-oauth';
+import { getPendingTokens } from './ms-login';
 import { DEFAULT_SETTINGS, mergeSettings } from './settings';
 import { withTotpDefaults } from './totp';
 import type {

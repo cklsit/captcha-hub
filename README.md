@@ -67,7 +67,10 @@ Electron ABI 不同：一个 `node_modules` 只能存在一种 ABI，装了原�
   `sandbox=""` 沙箱 iframe + `srcdoc` 内联 CSP 二次收口，远程图片默认拦截（可手动放宽）。
 - **TOTP 验证码在主进程生成**，渲染进程只拿到“当前验证码 + 剩余秒数”，永远接触不到明文密钥。
 - IMAP/SMTP 密码、OAuth 令牌、TOTP 密钥在落盘前加密（`safeStorage` 优先，AES-256-GCM 兜底）。
-- Microsoft 账户走 OAuth 2.0 设备码流程：访问/刷新令牌**只存在于主进程**，从不经过渲染层。
+- Microsoft 账户走 OAuth 2.0：**优先授权码 + PKCE + 回环重定向**——点一次按钮就跳转到微软
+  登录页，登录完自动回来，**无需填写邮箱地址、也无需输入验证码**；若 Azure 应用未注册
+  `http://localhost` 回调地址，会**自动降级**为设备码方式（先探测再决定，不会把用户丢在报错页上）。
+  访问/刷新令牌**只存在于主进程**，从不经过渲染层。
 - 界面不回显密钥/密码；编辑账户时密码留空表示不修改。
 - 所有数据保存在本机，不上传任何服务器。
 
@@ -100,7 +103,9 @@ mail-hub/
 │   ├── ingest-core.ts       # 纯函数：信封构造 + 验证码高亮
 │   ├── ingest.ts            # 同步编排：拉取→解析→净化→落库→通知
 │   ├── extractor.ts         # 验证码提取引擎（纯函数，结果降级为高亮）
-│   ├── ms-oauth.ts          # Microsoft 设备码流程 + scope 管理
+│   ├── ms-oauth.ts          # Microsoft OAuth 原语：端点/scope/令牌解析与刷新
+│   ├── ms-authcode.ts       # 授权码 + PKCE + 本地回环（一键跳转登录）
+│   ├── ms-login.ts          # 登录编排：重定向优先，设备码兜底
 │   ├── mail-auth.ts         # scope 感知的令牌刷新
 │   ├── totp.ts / otpauth.ts / qr.ts  # TOTP + QR 全套
 │   ├── dedupe.ts            # 去重（account::folder::uid）

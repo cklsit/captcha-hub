@@ -1,10 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
-  cancelLogin,
   classifyTokenResponse,
-  clearPendingLogins,
   deviceCodeEndpoint,
-  getPendingTokens,
   hasScope,
   isAccessTokenFresh,
   MS_DEFAULT_TENANT,
@@ -15,10 +12,17 @@ import {
   parseDeviceCodeResponse,
   parseScopes,
   parseTokenResponse,
-  pendingLoginCount,
-  pollLogin,
   tokenEndpoint,
 } from '../electron/ms-oauth';
+// The in-flight login registry moved to ms-login.ts so that the token layer
+// stays stateless; the assertions below still guard the same behaviour.
+import {
+  cancelLogin,
+  clearPendingLogins,
+  getPendingTokens,
+  msLoginPoll,
+  pendingLoginCount,
+} from '../electron/ms-login';
 
 /**
  * The Microsoft device-code flow is the only way into an Outlook mailbox now
@@ -205,8 +209,8 @@ describe('待处理登录注册表', () => {
     expect(pendingLoginCount()).toBe(0);
   });
 
-  it('pollLogin 对未知 flowId 直接返回错误，不发起网络请求', async () => {
-    const result = await pollLogin('does-not-exist');
+  it('msLoginPoll 对未知 flowId 直接返回错误，不发起网络请求', async () => {
+    const result = await msLoginPoll('does-not-exist');
     expect(result.status).toBe('error');
     expect(result.message).toContain('重新发起');
   });

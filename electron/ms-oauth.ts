@@ -1,25 +1,18 @@
-import { randomUUID } from 'node:crypto';
-import type { MsLoginPollResult, MsLoginStartResult, MsLoginStatus } from '../shared/types';
-
 /**
- * Microsoft OAuth 2.0 device-code flow.
+ * Microsoft OAuth 2.0 primitives: endpoints, scopes, token parsing and refresh.
+ *
+ * This module is the *pure* half of the Microsoft support — it holds no pending
+ * state and performs no flow orchestration. `ms-login.ts` drives the actual
+ * sign-in (redirect flow with a device-code fallback) and owns the registry of
+ * in-flight logins; `ms-authcode.ts` holds the PKCE/loopback machinery.
+ * Splitting them this way keeps each unit testable and avoids an import cycle.
  *
  * Basic Authentication is dead for IMAP — outlook.office365.com advertises
  * `LOGINDISABLED` and answers every LOGIN with `NO Basic authentication is
- * disabled.` An OAuth access token is the only way in, and the device-code
- * grant is the right fit for a desktop app: no redirect URI, no embedded
- * browser, no local web server. The user opens a Microsoft page, types a short
- * code, and we poll for the token.
+ * disabled.` An OAuth access token is the only way in.
  *
- * Data flow, deliberately:
- *   renderer  ──start/poll──▶  main process  ──HTTPS──▶  Microsoft
- *   renderer      ◀──user code + status only──┘
- *
- * Tokens NEVER cross the IPC bridge. They stay in this module's pending-login
- * registry until `store.ts` persists them (encrypted) onto the source.
- *
- * This module intentionally imports nothing from Electron so it stays unit
- * testable; the HTTP seams return parsed JSON instead of throwing.
+ * Imports nothing from Electron, so it stays unit testable; the HTTP seams
+ * return parsed JSON instead of throwing.
  */
 
 /** IMAP scope for the Outlook resource — valid for both personal and work accounts. */
@@ -35,8 +28,16 @@ export const MS_SMTP_SCOPE = 'https://outlook.office.com/SMTP.Send';
 /** `common` serves personal (outlook.com/hotmail) and work/school tenants alike. */
 export const MS_DEFAULT_TENANT = 'common';
 
+/**
+ * OIDC scopes. Asking for `openid` is what makes Microsoft return an id_token,
+ * whose `preferred_username` carries the signed-in address — that is how the
+ * form fills the mailbox field for the user instead of asking them to type it.
+ * These are standard OIDC scopes and need no extra API permission entry.
+ */
+export const MS_OIDC_SCOPES = ['openid', 'profile', 'email'];
+
 /** `offline_access` is what makes Microsoft hand back a refresh token. */
-export const MS_SCOPES = ['offline_access', MS_IMAP_SCOPE, MS_SMTP_SCOPE];
+export const MS_SCOPES = ['offline_access', ...MS_OIDC_SCOPES, MS_IMAP_SCOPE, MS_SMTP_SCOPE];
 
 /** Normalises a space-delimited `scope` value into a trimmed list. */
 export function parseScopes(value: unknown): string[] {
@@ -57,7 +58,9 @@ export function hasScope(scopes: string[], wanted: string): boolean {
 const EXPIRY_SKEW_MS = 120_000;
 
 const MIN_INTERVAL_SEC = 5;
-const MAX_INTERVAL_SEC = 60;
+
+/** Upper bound for device-code polling; also applied when the server says slow_down. */
+export const MAX_INTERVAL_SEC = 60;
 
 export interface TokenSet {
   accessToken: string;
@@ -66,6 +69,11 @@ export interface TokenSet {
   expiresAt: number;
   /** Scope set Microsoft reports as actually granted. */
   scopes: string[];
+  /**
+   * The signed-in address, read from the id_token. Empty when the provider did
+   * not return one — callers must treat it as a hint, never as a requirement.
+   */
+  account: string;
 }
 
 /* ------------------------------------------------------------ pure helpers */
@@ -121,6 +129,47 @@ export function parseDeviceCodeResponse(payload: unknown): DeviceCodeInfo | null
   };
 }
 
+/**
+ * Decodes a JWT payload without verifying its signature.
+ *
+ * That is deliberate and safe here: the token arrives over TLS straight from
+ * Microsoft's token endpoint, and its only use is a *prefill hint* for the
+ * mailbox field — the value is shown to the user and can be corrected by hand.
+ * Nothing is authorised on the strength of it.
+ */
+export function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+  try {
+    const json = Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString(
+      'utf8',
+    );
+    const parsed: unknown = JSON.parse(json);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reads the signed-in address out of an id_token.
+ *
+ * `preferred_username` is checked first because it is always present: for
+ * personal accounts it *is* the address, and for work/school accounts it is the
+ * UPN, which is normally the address too. The dedicated `email` claim is only
+ * emitted when the app registration opts into it, so it is a fallback rather
+ * than the primary source.
+ */
+export function parseIdTokenAccount(idToken: string): string {
+  const payload = decodeJwtPayload(idToken);
+  if (!payload) return '';
+  for (const claim of ['preferred_username', 'email', 'upn', 'unique_name']) {
+    const value = asString(payload[claim]).trim();
+    if (value.includes('@')) return value;
+  }
+  return '';
+}
+
 export function parseTokenResponse(payload: unknown, now: number = Date.now()): TokenSet | null {
   if (!payload || typeof payload !== 'object') return null;
   const raw = payload as Record<string, unknown>;
@@ -137,6 +186,7 @@ export function parseTokenResponse(payload: unknown, now: number = Date.now()): 
     refreshToken: asString(raw.refresh_token),
     expiresAt: now + asPositiveInt(raw.expires_in, 3600) * 1000,
     scopes: granted.length > 0 ? granted : [...MS_SCOPES],
+    account: parseIdTokenAccount(asString(raw.id_token)),
   };
 }
 
@@ -202,47 +252,16 @@ export function isAccessTokenFresh(
   return expiresAt > now + skewMs;
 }
 
-/* -------------------------------------------------------- pending registry */
-
-interface PendingLogin {
-  clientId: string;
-  tenant: string;
-  deviceCode: string;
-  intervalSec: number;
-  /** When the *device code* (not the token) stops being accepted. */
-  expiresAt: number;
-  tokens: TokenSet | null;
-}
-
-/** Keyed by flow id; lives for the lifetime of the app process only. */
-const pendingLogins = new Map<string, PendingLogin>();
-
-/** Tokens for a completed login, or null while it is still pending. */
-export function getPendingTokens(flowId: string): TokenSet | null {
-  return pendingLogins.get(flowId)?.tokens ?? null;
-}
-
-export function cancelLogin(flowId: string): void {
-  pendingLogins.delete(flowId);
-}
-
-/** Test seam — drops every pending login. */
-export function clearPendingLogins(): void {
-  pendingLogins.clear();
-}
-
-export function pendingLoginCount(): number {
-  return pendingLogins.size;
-}
-
 /* ------------------------------------------------------------------- HTTP */
 
 /**
  * POSTs a form body and always resolves with a JSON object. Microsoft's
  * device-code and token endpoints report failures as JSON too, so a parse
  * failure is surfaced as an OAuth-shaped error rather than an exception.
+ *
+ * Exported as the HTTP seam shared with `ms-login.ts`.
  */
-async function postForm(url: string, body: Record<string, string>): Promise<unknown> {
+export async function postForm(url: string, body: Record<string, string>): Promise<unknown> {
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -254,97 +273,6 @@ async function postForm(url: string, body: Record<string, string>): Promise<unkn
     return JSON.parse(text) as unknown;
   } catch {
     return { error: 'unexpected_response', error_description: text.slice(0, 200) };
-  }
-}
-
-/** Step 1: ask Microsoft for a device code and remember the pending login. */
-export async function requestDeviceCode(
-  clientId: string,
-  tenant: string,
-): Promise<MsLoginStartResult> {
-  const id = clientId.trim();
-  if (!id) return { ok: false, message: '请先填写 Application (client) ID。' };
-
-  try {
-    const payload = await postForm(deviceCodeEndpoint(tenant), {
-      client_id: id,
-      scope: MS_SCOPES.join(' '),
-    });
-    const info = parseDeviceCodeResponse(payload);
-    if (!info) {
-      const raw = payload as Record<string, unknown> | null;
-      const detail = raw ? errorDescription(raw) : '';
-      return {
-        ok: false,
-        message: detail
-          ? `无法获取设备码：${detail}`
-          : '无法获取设备码，请检查 Application (client) ID 与网络。',
-      };
-    }
-
-    const flowId = randomUUID();
-    pendingLogins.set(flowId, {
-      clientId: id,
-      tenant: (tenant || '').trim() || MS_DEFAULT_TENANT,
-      deviceCode: info.deviceCode,
-      intervalSec: info.intervalSec,
-      expiresAt: Date.now() + info.expiresInSec * 1000,
-      tokens: null,
-    });
-
-    return {
-      ok: true,
-      message: info.message || '请在浏览器中完成 Microsoft 登录。',
-      flowId,
-      userCode: info.userCode,
-      verificationUri: info.verificationUri,
-      expiresInSec: info.expiresInSec,
-      intervalSec: info.intervalSec,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      message: `连接 Microsoft 失败：${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
-}
-
-/** Step 2: one poll. The renderer repeats this until the status is not pending. */
-export async function pollLogin(flowId: string): Promise<MsLoginPollResult> {
-  const entry = pendingLogins.get(flowId);
-  if (!entry) return { status: 'error', message: '登录会话已失效，请重新发起登录。' };
-  if (entry.tokens) return { status: 'success', message: '登录成功，令牌已保存在本机。' };
-
-  if (Date.now() > entry.expiresAt) {
-    pendingLogins.delete(flowId);
-    return { status: 'error', message: '设备码已过期，请重新发起登录。' };
-  }
-
-  try {
-    const payload = await postForm(tokenEndpoint(entry.tenant), {
-      client_id: entry.clientId,
-      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-      device_code: entry.deviceCode,
-      scope: MS_SCOPES.join(' '),
-    });
-
-    const outcome = classifyTokenResponse(payload);
-    if (outcome.status === 'success') {
-      entry.tokens = outcome.tokens;
-      return { status: 'success', message: '登录成功，令牌已保存在本机。' };
-    }
-    if (outcome.status === 'slow_down') {
-      entry.intervalSec = Math.min(MAX_INTERVAL_SEC, entry.intervalSec + 5);
-    }
-    if (outcome.status === 'error') pendingLogins.delete(flowId);
-
-    return { status: outcome.status as MsLoginStatus, message: outcome.message };
-  } catch (error) {
-    // Transient network hiccup: keep the login alive and let the caller retry.
-    return {
-      status: 'pending',
-      message: `网络波动，重试中：${error instanceof Error ? error.message : String(error)}`,
-    };
   }
 }
 
