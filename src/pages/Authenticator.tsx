@@ -7,33 +7,60 @@ import Dialog from '@mui/material/Dialog';
 import DialogActions from '@mui/material/DialogActions';
 import DialogContent from '@mui/material/DialogContent';
 import DialogTitle from '@mui/material/DialogTitle';
+import IconButton from '@mui/material/IconButton';
 import Stack from '@mui/material/Stack';
 import TextField from '@mui/material/TextField';
+import Tooltip from '@mui/material/Tooltip';
 import Typography from '@mui/material/Typography';
 import AddIcon from '@mui/icons-material/Add';
+import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
+import EditOutlinedIcon from '@mui/icons-material/EditOutlined';
 import FileDownloadOutlinedIcon from '@mui/icons-material/FileDownloadOutlined';
 import FileUploadOutlinedIcon from '@mui/icons-material/FileUploadOutlined';
 import LockClockOutlinedIcon from '@mui/icons-material/LockClockOutlined';
-import type { TotpDisplay, TotpExportItem } from '../../shared/types';
+import type { SafeTotpEntry, TotpDisplay, TotpEntryInput, TotpExportItem } from '../../shared/types';
 import { api } from '../api';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { EmptyState } from '../components/EmptyState';
 import { TotpCard } from '../components/TotpCard';
+import { TotpForm } from '../components/TotpForm';
 import { useToast } from '../components/Toast';
 
 interface AuthenticatorProps {
   onCopy: (text: string) => void;
   onChanged: () => void;
-  onGoSources: () => void;
 }
 
 const REFRESH_INTERVAL_MS = 1000;
 
+/** Rebuilds an editable entry from a live display (secrets stay in main). */
+function entryFromDisplay(display: TotpDisplay): SafeTotpEntry {
+  return {
+    id: display.id,
+    name: display.name,
+    enabled: display.enabled,
+    createdAt: 0,
+    updatedAt: 0,
+    totp: {
+      algorithm: 'SHA1',
+      digits: 6,
+      period: display.period,
+      issuer: display.issuer,
+      account: display.account,
+      note: '',
+      hasSecret: true,
+    },
+  };
+}
+
 /** Live TOTP authenticator. Codes are generated in the main process each tick. */
-export function Authenticator({ onCopy, onChanged, onGoSources }: AuthenticatorProps): JSX.Element {
+export function Authenticator({ onCopy, onChanged }: AuthenticatorProps): JSX.Element {
   const toast = useToast();
   const [displays, setDisplays] = useState<TotpDisplay[]>([]);
   const [loading, setLoading] = useState(true);
+  const [formOpen, setFormOpen] = useState(false);
+  const [editing, setEditing] = useState<SafeTotpEntry | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<SafeTotpEntry | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState('');
   const [importError, setImportError] = useState<string | null>(null);
@@ -61,6 +88,28 @@ export function Authenticator({ onCopy, onChanged, onGoSources }: AuthenticatorP
     return () => window.clearInterval(timer);
   }, [refresh]);
 
+  async function handleCreateOrUpdate(input: TotpEntryInput): Promise<void> {
+    if (editing) await api.totp.update(editing.id, input);
+    else await api.totp.create(input);
+    toast(editing ? '验证器已更新' : '验证器已添加', 'success');
+    onChanged();
+    await refresh();
+  }
+
+  async function handleDelete(): Promise<void> {
+    const target = deleteTarget;
+    setDeleteTarget(null);
+    if (!target) return;
+    try {
+      await api.totp.remove(target.id);
+      toast('验证器已删除', 'success');
+      onChanged();
+      await refresh();
+    } catch (error) {
+      toast(error instanceof Error ? error.message : String(error), 'error');
+    }
+  }
+
   async function handleExport(includeSecrets: boolean): Promise<void> {
     setBusy(true);
     try {
@@ -69,10 +118,7 @@ export function Authenticator({ onCopy, onChanged, onGoSources }: AuthenticatorP
         toast('没有可导出的验证器', 'info');
         return;
       }
-      const result = await api.system.saveTextFile(
-        'captcha-hub-totp.json',
-        JSON.stringify(items, null, 2),
-      );
+      const result = await api.system.saveTextFile('mail-hub-totp.json', JSON.stringify(items, null, 2));
       if (result.saved) toast('验证器已导出', 'success');
     } catch (error) {
       toast(error instanceof Error ? error.message : String(error), 'error');
@@ -110,13 +156,18 @@ export function Authenticator({ onCopy, onChanged, onGoSources }: AuthenticatorP
     }
   }
 
+  function openCreate(): void {
+    setEditing(null);
+    setFormOpen(true);
+  }
+
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, px: 3, pt: 3, pb: 1.5 }}>
         <Typography variant="h6">验证器</Typography>
         <Chip size="small" label={`${displays.length} 个`} />
         <Box sx={{ ml: 'auto', display: 'flex', gap: 1 }}>
-          <Button size="small" startIcon={<AddIcon />} onClick={onGoSources}>
+          <Button size="small" startIcon={<AddIcon />} onClick={openCreate}>
             添加验证器
           </Button>
           <Button
@@ -146,9 +197,9 @@ export function Authenticator({ onCopy, onChanged, onGoSources }: AuthenticatorP
           <EmptyState
             icon={<LockClockOutlinedIcon />}
             title="还没有 TOTP 验证器"
-            description="在“来源管理”中新增一个 TOTP 验证器，填入你已有的 Base32 密钥即可看到实时验证码。"
+            description="点击「添加验证器」，填入已有的 Base32 密钥或扫描二维码，即可看到实时验证码。"
             action={
-              <Button variant="contained" startIcon={<AddIcon />} onClick={onGoSources}>
+              <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
                 去添加
               </Button>
             }
@@ -157,17 +208,60 @@ export function Authenticator({ onCopy, onChanged, onGoSources }: AuthenticatorP
           <Box
             sx={{
               display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))',
               gap: 1.5,
               pt: 1,
             }}
           >
             {displays.map((display) => (
-              <TotpCard key={display.id} data={display} onCopy={onCopy} />
+              <Box key={display.id} sx={{ position: 'relative' }}>
+                <TotpCard data={display} onCopy={onCopy} />
+                <Box
+                  sx={{
+                    position: 'absolute',
+                    top: 8,
+                    right: 8,
+                    display: 'flex',
+                    gap: 0.25,
+                    bgcolor: 'background.paper',
+                    borderRadius: 1,
+                    opacity: 0.85,
+                  }}
+                >
+                  <Tooltip title="编辑">
+                    <IconButton
+                      size="small"
+                      onClick={() => {
+                        setEditing(entryFromDisplay(display));
+                        setFormOpen(true);
+                      }}
+                    >
+                      <EditOutlinedIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip title="删除">
+                    <IconButton size="small" color="error" onClick={() => setDeleteTarget(entryFromDisplay(display))}>
+                      <DeleteOutlineIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                </Box>
+              </Box>
             ))}
           </Box>
         )}
       </Box>
+
+      <TotpForm open={formOpen} initial={editing} onClose={() => setFormOpen(false)} onSubmit={handleCreateOrUpdate} />
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        title="删除验证器？"
+        description={`确定要删除「${deleteTarget?.name ?? ''}」吗？该操作不可撤销。`}
+        confirmLabel="删除"
+        danger
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={() => void handleDelete()}
+      />
 
       <ConfirmDialog
         open={exportConfirmOpen}

@@ -1,0 +1,134 @@
+%% Mail Hub 增量关键调用流程（四张时序图）—— R2 纯 JS 存储版
+
+%% ========== 1. 同步邮件（全量入库 + 高亮元数据 + 正文落盘） ==========
+sequenceDiagram
+  participant R as Renderer
+  participant IPC as ipc.ts
+  participant SY as ingest.ts (SyncService)
+  participant AU as mail-auth.ts
+  participant OA as ms-oauth.ts
+  participant IM as imap.ts
+  participant PM as parse-mail.ts
+  participant SA as sanitize.ts
+  participant EX as extractor.ts
+  participant MSC as mail-store-core.ts
+  participant CFG as store.ts (ConfigStore)
+
+  R->>IPC: sync.now(accountId?)
+  IPC->>SY: syncAll(accountId?)
+  SY->>CFG: listAccounts 同步游标
+  loop 每个启用账户
+    SY->>AU: ensureFreshCredentials(account)
+    AU->>OA: refreshAccessToken(clientId, tenant, refreshToken, scopes)
+    OA-->>AU: TokenSet
+    AU->>CFG: updateAccountTokens(scopes)
+    SY->>IM: listFolders(credentials)
+    IM-->>SY: Folder[]
+    SY->>CFG: 保存 folders
+    loop 每个订阅文件夹
+      SY->>IM: fetchFolder(credentials, path, sinceUid)
+      IM->>PM: parse(source)
+      PM-->>IM: {subject,from,to,cc,text,html,attachments}
+      IM-->>SY: ParsedMail[]
+      loop 每封邮件（无条件全量）
+        SY->>EX: extractCode({subject,text,from})
+        EX-->>SY: ExtractedCode | null  (降级为 highlight)
+        SY->>SA: sanitizeMailHtml(html, {allowRemoteImages:false})
+        SA-->>SY: safeHtml
+        SY->>MSC: writeBody(accountId, folderId, uid, {text,html,safeHtml})  (原子写+路径安全化)
+        SY->>MSC: upsertEnvelopes(accountId, folderId, envelope)  (去重键 accountId::folderId::uid)
+      end
+    end
+    SY->>CFG: 保存 lastUid / uidValidity；MSC.folderCounts 更新未读计数
+  end
+  SY-->>IPC: SyncResult
+  IPC-->>R: SyncResult
+  SY--)R: broadcast('mail:new', inserted) / ('sync:state') / ('folders:changed')
+
+%% ========== 2. 发信（SMTP / OAuth，含 scope 缺失重授权） ==========
+sequenceDiagram
+  participant R as Renderer (ComposeWindow)
+  participant IPC as ipc.ts
+  participant DS as drafts.ts
+  participant SM as smtp.ts
+  participant AU as mail-auth.ts
+  participant CS as store.ts (ConfigStore)
+  participant IM as imap.ts
+
+  R->>IPC: compose.send(payload)
+  IPC->>CS: getAccount(accountId)
+  IPC->>SM: send(payload, credentials)
+  alt authType === oauth2
+    SM->>AU: ensureFreshCredentials(account, needSmtp)
+    AU->>AU: 校验 scopes 含 SMTP.Send
+    alt 未授予 SMTP scope
+      AU-->>SM: throw needsReauth（需重新授权以启用发信）
+      SM-->>IPC: { ok:false, needsReauth:true, message }
+      IPC-->>R: 提示「重新登录 Microsoft 账户」
+    else 已授予
+      AU-->>SM: 新鲜 accessToken (XOAUTH2)
+      SM->>SM: nodemailer transport.sendMail()
+    end
+  else password
+    SM->>SM: transport.sendMail()
+  end
+  SM-->>IPC: SendResult
+  alt 发送成功
+    IPC->>DS: deleteDraft(draftId?)  (若来自草稿)
+    IPC-->>R: { ok:true }
+    R--)R: toast('已发送')
+  end
+
+%% ========== 3. 附件下载（按需，不落盘） ==========
+sequenceDiagram
+  participant R as Renderer (AttachmentList)
+  participant IPC as ipc.ts
+  participant AT as attachments.ts
+  participant MSC as mail-store-core.ts
+  participant IM as imap.ts
+  participant CS as store.ts
+
+  R->>IPC: attachments.download(messageId, partId)
+  IPC->>MSC: getEnvelope(messageId)
+  MSC-->>IPC: { accountId, folderId, uid, attachments }
+  IPC->>CS: getAccount(accountId)  (+ensureFreshCredentials)
+  IPC->>AT: download(account, folderPath, uid, partId)
+  AT->>IM: fetchAttachment(credentials, folderPath, uid, partId)
+  IM-->>AT: { filename, content } | null
+  alt 附件存在
+    AT->>AT: dialog.showSaveDialog(默认名=filename)
+    AT->>AT: fs.writeFile(path, content)
+    AT-->>IPC: { saved:true, path }
+    IPC-->>R: 提示保存路径
+  else 缺失/取回失败
+    AT-->>IPC: { saved:false, error:'附件在服务器上已不存在或下载失败' }
+    IPC-->>R: 可读错误
+  end
+
+%% ========== 4. 首次启动迁移（Q5/Q7/品牌联合流程） ==========
+sequenceDiagram
+  participant M as main.ts
+  participant MG as migrate.ts
+  participant MC as migrate-core.ts (pure)
+  participant CS as store.ts
+  participant MSC as mail-store-core.ts
+  participant R as Renderer
+
+  M->>CS: getSettings()
+  alt settings.migratedFromV1 !== true
+    M->>MG: migrate()
+    MG->>MG: 读 %APPDATA%/Captcha Hub/captcha-hub-data.json
+    alt 旧文件存在
+      MG->>MC: migrateV1ToV2(oldJson)
+      MC-->>MG: { accounts, totpEntries, envelopes, bodies, settings, droppedPhoneCount }
+      MG->>CS: 写入 accounts/totpEntries/envelopes/settings(+migratedFromV1)
+      MG->>MSC: writeBody(...) 每封旧邮件（bodyTruncated=true）
+      MG->>MG: 旧文件重命名 .bak
+      MG-->>M: { droppedPhoneCount }
+      M->>CS: settings.migrationNotice（若有）
+    else 无旧文件
+      MG-->>M: no-op
+    end
+  end
+  M->>R: 启动窗口
+  R->>R: 若 migrationNotice 显示一次性横幅（已移除「手机号来源」）

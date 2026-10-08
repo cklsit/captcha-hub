@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractCode, resolveSourceForMail } from '../electron/extractor';
-import type { Source } from '../shared/types';
+import { extractCode } from '../electron/extractor';
 
 /**
  * QA-independent verification of the extraction engine.
@@ -10,21 +9,6 @@ import type { Source } from '../shared/types';
  * than loose "not null" checks, so a regression cannot hide behind a non-empty
  * return value.
  */
-
-function source(partial: Partial<Source> & Pick<Source, 'id' | 'kind' | 'name'>): Source {
-  return {
-    enabled: true,
-    createdAt: 0,
-    updatedAt: 0,
-    lastSyncAt: null,
-    lastSyncStatus: 'never',
-    lastSyncError: null,
-    email: null,
-    phone: null,
-    totp: null,
-    ...partial,
-  };
-}
 
 describe('QA extractCode — Chinese templates', () => {
   it('【微博】您的验证码是 123456，5分钟内有效', () => {
@@ -111,122 +95,5 @@ describe('QA extractCode — empty / no-candidate inputs', () => {
 
   it('returns null when there is no digit/alnum token at all', () => {
     expect(extractCode({ subject: 'hello', text: 'world, nothing here' })).toBeNull();
-  });
-});
-
-describe('QA resolveSourceForMail — attribution rules', () => {
-  const emailSource = source({
-    id: 'email-1',
-    kind: 'email',
-    name: '我的邮箱',
-    email: {
-      host: 'imap.example.com',
-      port: 993,
-      secure: true,
-      username: 'me@example.com',
-      password: 'secret',
-      mailbox: 'INBOX',
-      authType: 'password',
-      clientId: '',
-      tenant: 'common',
-      refreshToken: '',
-      accessToken: '',
-      accessTokenExpiresAt: 0,
-    },
-  });
-
-  const phoneBySubject = source({
-    id: 'phone-subject',
-    kind: 'phone',
-    name: '138****8000',
-    phone: {
-      phoneNumber: '+8613800138000',
-      rule: { emailSourceId: 'email-1', matchField: 'subject', matchKeyword: '短信转发' },
-    },
-  });
-
-  const phoneByFrom = source({
-    id: 'phone-from',
-    kind: 'phone',
-    name: '139****9000',
-    phone: {
-      phoneNumber: '+8613900139000',
-      rule: { emailSourceId: 'email-1', matchField: 'from', matchKeyword: 'sms-gateway' },
-    },
-  });
-
-  const phoneByBody = source({
-    id: 'phone-body',
-    kind: 'phone',
-    name: '137****7000',
-    phone: {
-      phoneNumber: '+8613700137000',
-      rule: { emailSourceId: 'email-1', matchField: 'body', matchKeyword: 'bancnote-token' },
-    },
-  });
-
-  it('attributes to the phone source when the subject rule matches', () => {
-    const resolved = resolveSourceForMail(
-      { subject: '【短信转发】验证码 123456', from: 'forward@example.com', text: '...' },
-      'email-1',
-      [emailSource, phoneBySubject],
-    );
-    expect(resolved?.source.id).toBe('phone-subject');
-    expect(resolved?.matchedByRule).toBe(true);
-  });
-
-  it('attributes to the phone source when the from rule matches', () => {
-    const resolved = resolveSourceForMail(
-      { subject: 'no keyword here', from: 'noreply@sms-gateway.example', text: '...' },
-      'email-1',
-      [emailSource, phoneByFrom],
-    );
-    expect(resolved?.source.id).toBe('phone-from');
-    expect(resolved?.matchedByRule).toBe(true);
-  });
-
-  it('attributes to the phone source when the body rule matches', () => {
-    const resolved = resolveSourceForMail(
-      { subject: 'x', from: 'y', text: 'your bancnote-token 998877' },
-      'email-1',
-      [emailSource, phoneByBody],
-    );
-    expect(resolved?.source.id).toBe('phone-body');
-    expect(resolved?.matchedByRule).toBe(true);
-  });
-
-  it('falls back to the email source when no rule matches', () => {
-    const resolved = resolveSourceForMail(
-      { subject: '普通邮件', from: 'someone@example.com', text: '...' },
-      'email-1',
-      [emailSource, phoneBySubject],
-    );
-    expect(resolved?.source.id).toBe('email-1');
-    expect(resolved?.matchedByRule).toBe(false);
-  });
-
-  it('ignores a phone rule bound to a different email source', () => {
-    const foreignPhone = source({
-      id: 'phone-foreign',
-      kind: 'phone',
-      name: '135****5000',
-      phone: {
-        phoneNumber: '+8613500135000',
-        rule: { emailSourceId: 'email-OTHER', matchField: 'subject', matchKeyword: '短信转发' },
-      },
-    });
-    const resolved = resolveSourceForMail(
-      { subject: '【短信转发】验证码 123456', from: 'f@e.com', text: '...' },
-      'email-1',
-      [emailSource, foreignPhone],
-    );
-    expect(resolved?.source.id).toBe('email-1');
-    expect(resolved?.matchedByRule).toBe(false);
-  });
-
-  it('returns null when the email source does not exist', () => {
-    expect(
-      resolveSourceForMail({ subject: 'x', from: 'y', text: 'z' }, 'missing', [phoneBySubject]),
-    ).toBeNull();
   });
 });

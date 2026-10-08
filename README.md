@@ -1,22 +1,25 @@
-# 验证码收件箱 · Captcha Hub
+# 邮件中心 · Mail Hub
 
-一款 Windows 桌面应用，把**你自己拥有**的多个验证码来源汇聚到单一界面查看。
+一款本地优先的 Windows 桌面**邮件客户端**：多账户收发、文件夹与附件管理、
+验证码自动高亮一键复制，内置 TOTP 验证器。
 
-> 合规红线：本应用仅用于帮助你管理**本人拥有或有权使用**的验证码来源，必须能够回验所有权。
-> 它**不是**接码平台，不提供代收、代持、转卖他人号码的能力。
+> 合规红线：本应用仅用于帮助你管理**你本人拥有或有权使用**的邮箱账户。
+> 它**不是**接码平台，不提供代收、代持、转卖他人邮箱或号码验证码的能力。
 
 ---
 
-## 1. 为什么需要“邮箱转发通道”？
+## 1. 这是什么？
 
-Windows 桌面设备**没有蜂窝射频，无法直接接收短信**。因此短信/验证码通过以下方式进入本应用：
+Mail Hub 把**你自己拥有**的一个或多个邮箱汇聚到一个桌面界面，用 IMAP 增量收取、
+用 SMTP 发信，并把收到的邮件**无条件**全部入库。内置的验证码提取引擎会把识别到的
+验证码**高亮**在列表与正文中，支持一键复制；但它**不再决定是否入库**——所有邮件都会保留。
 
 ```
-手机 / 运营商 ──(转发)──▶ 你的邮箱 ──(IMAP)──▶ Captcha Hub 桌面端 ──▶ 提取验证码
+邮箱服务器 ──(IMAP)──▶ Mail Hub ──(索引 + 正文落盘)──▶ 三栏阅读界面
+             ◀─(SMTP)── 写信 / 回复 / 转发
 ```
 
-你在手机上（或运营商侧）把短信通知转发到某个邮箱，桌面端用 IMAP 定时收取该邮箱邮件，
-再用内置的提取引擎识别验证码。TOTP 2FA 则支持手动录入 Base32 密钥，本地实时生成。
+TOTP 2FA 支持手动录入 Base32 密钥或扫描二维码，本地实时生成验证码。
 
 ## 2. 技术栈
 
@@ -25,60 +28,91 @@ Windows 桌面设备**没有蜂窝射频，无法直接接收短信**。因此�
 | 桌面壳 | Electron 30（主进程负责所有敏感/IO 逻辑） |
 | 渲染层 | React 18 + TypeScript + Vite |
 | UI | MUI (Material UI) + Tailwind CSS（默认深色主题，可切换明/暗） |
-| 邮件收取 | `imapflow` + `mailparser` |
+| 收信 | `imapflow`（XOAUTH2、文件夹、移动/删除/取附件） |
+| 发信 | `nodemailer`（密码 + OAuth2 XOAUTH2、MIME/附件构建） |
+| 邮件解析 | `mailparser` |
+| HTML 净化 | `sanitize-html`（主进程）+ 沙箱 iframe（渲染层）双保险 |
 | TOTP | `otplib`（RFC 6238，支持 SHA1/SHA256/SHA512、6/8 位、自定义周期） |
-| 本地存储 | **`electron-store`**（纯 JS，见下方说明） |
+| QR | `jsqr` |
+| 配置存储 | **`electron-store`**（账户/密钥/设置/信封索引，纯 JS） |
+| 正文存储 | **`node:fs` 磁盘文件（Maildir 风格，一邮件一文件）** |
 | 敏感信息加密 | Electron `safeStorage`，不可用时降级为 AES-256-GCM + 机器指纹派生密钥 |
 | 打包 | `electron-builder`（Windows NSIS） |
 | 测试 | `vitest` |
 
-### 关于存储引擎的取舍
+### 关于存储引擎的取舍（零原生依赖）
 
-原方案建议 `better-sqlite3`。它在 Windows 上需要本机编译原生模块（依赖完整 MSVC 工具链），
-在普通开发机上极易安装失败。为保证 **“能装、能跑、能构建”**，本项目改用纯 JS 的
-`electron-store`（底层是 JSON 文件 + 原子写入），并在存储层做了抽象封装
-（`electron/store.ts`），未来若要换成 SQLite 只需替换该文件实现。**这是相对设计文档的唯一主动偏离。**
+本项目**刻意不引入任何原生模块**（包括 `better-sqlite3`）。原因是本机 Node ABI 与
+Electron ABI 不同：一个 `node_modules` 只能存在一种 ABI，装了原生模块会让
+`npm test`（Node 环境）与 `npm run dev`（Electron 环境）**互斥**。
+
+因此存储完全由纯 JS 承担，并拆成两层以便单测：
+
+- **`electron/mail-store-core.ts`（纯模块）**：信封索引 + 磁盘正文读写（原子写、路径安全化），
+  `rootDir` 由构造参数注入，**零 `electron` 依赖**，可在 CI 临时目录中完整单测。
+- **`electron/mail-service.ts`（薄封装）**：用 `app.getPath('userData')` 拼出 `rootDir` 注入单例。
+
+| 数据域 | 载体 | 位置 |
+| --- | --- | --- |
+| 账户（IMAP/SMTP 凭据）、设置、TOTP 条目 | `electron-store` | `%APPDATA%/Mail Hub/mail-hub-data.json`（密钥加密） |
+| 信封索引（邮件元数据） | `electron-store` | 同上，运行时整份载入内存 |
+| 正文 / 报文 | `node:fs` | `<userData>/mail/accounts/<accountId>/<folderId>/<uid>.json` |
+| 附件二进制 | 按需下载 | 用户选定目录 |
 
 ## 3. 安全与隐私设计
 
 - 主进程 `contextIsolation: true`、`nodeIntegration: false`；渲染进程只能通过 `preload` 的
-  `contextBridge` 暴露的**受控 API** 访问能力。
+  `contextBridge` 暴露的**受控 API**（`MailHubApi`）访问能力。
+- **邮件 HTML 双保险**：主进程 `sanitize-html` 剥离脚本/内联事件/危险标签；渲染层再用
+  `sandbox=""` 沙箱 iframe + `srcdoc` 内联 CSP 二次收口，远程图片默认拦截（可手动放宽）。
 - **TOTP 验证码在主进程生成**，渲染进程只拿到“当前验证码 + 剩余秒数”，永远接触不到明文密钥。
-- 邮箱授权码、TOTP 密钥、OAuth 令牌在落盘前加密（`safeStorage` 优先，AES-256-GCM 兜底）。
-- Microsoft 账户走 OAuth 2.0 设备码流程：访问/刷新令牌**只存在于主进程**，从不经过
-  渲染层，界面只会显示设备码与状态。
-- 界面不回显密钥/密码；编辑来源时密码留空表示不修改。
+- IMAP/SMTP 密码、OAuth 令牌、TOTP 密钥在落盘前加密（`safeStorage` 优先，AES-256-GCM 兜底）。
+- Microsoft 账户走 OAuth 2.0 设备码流程：访问/刷新令牌**只存在于主进程**，从不经过渲染层。
+- 界面不回显密钥/密码；编辑账户时密码留空表示不修改。
 - 所有数据保存在本机，不上传任何服务器。
 
 ## 4. 目录结构
 
 ```
-captcha-hub/
+mail-hub/
 ├── package.json / tsconfig.json / vite.config.ts / vitest.config.ts
 ├── tailwind.config.js / postcss.config.js / electron-builder.yml
 ├── index.html / README.md
+├── docs/
+│   └── microsoft-oauth-setup.md
 ├── shared/
-│   └── types.ts              # 主进程与渲染进程共享的领域类型
+│   └── types.ts              # 主进程与渲染进程共享的领域类型（MailHubApi）
 ├── electron/
-│   ├── main.ts              # 主进程入口：窗口、生命周期、单实例
-│   ├── preload.ts           # contextBridge 暴露受控 API
+│   ├── main.ts              # 主进程入口：窗口、生命周期、启动迁移
+│   ├── preload.ts           # contextBridge 暴露 MailHubApi
 │   ├── ipc.ts               # 所有 ipcMain.handle 注册
-│   ├── store.ts             # 存储层（sources / messages / settings）
+│   ├── store.ts             # 配置存储（accounts / totpEntries / settings / 信封索引）
+│   ├── mail-store-core.ts   # 纯 JS 存储核心（信封索引 + 正文文件，可单测）
+│   ├── mail-service.ts      # 注入 userData 的存储单例
+│   ├── migrate.ts / migrate-core.ts  # 旧数据一次性迁移（纯函数 + 落库）
 │   ├── crypto.ts            # safeStorage 封装 + AES-256-GCM 降级
-│   ├── imap.ts              # IMAP 拉取与连接测试
-│   ├── extractor.ts         # 验证码提取引擎（纯函数 + 来源归属）
-│   ├── totp.ts              # TOTP 生成与倒计时
-│   ├── dedupe.ts            # 去重/合并（纯函数）
-│   ├── ingest.ts            # 采集编排：拉取→提取→归属→落库→通知
-│   ├── scheduler.ts         # 定时轮询调度
+│   ├── imap.ts              # IMAP：文件夹、增量拉取、已读/移动/删除/取附件、连接测试
+│   ├── smtp.ts              # SMTP：发信（密码/OAuth2）、连接测试、Sent 副本
+│   ├── attachments.ts       # 附件按需下载
+│   ├── drafts.ts            # 草稿 CRUD + 回复/转发预填
+│   ├── parse-mail.ts        # 纯函数：解析邮件为 text/html/附件元数据
+│   ├── sanitize.ts          # 纯函数：HTML 净化
+│   ├── ingest-core.ts       # 纯函数：信封构造 + 验证码高亮
+│   ├── ingest.ts            # 同步编排：拉取→解析→净化→落库→通知
+│   ├── extractor.ts         # 验证码提取引擎（纯函数，结果降级为高亮）
+│   ├── ms-oauth.ts          # Microsoft 设备码流程 + scope 管理
+│   ├── mail-auth.ts         # scope 感知的令牌刷新
+│   ├── totp.ts / otpauth.ts / qr.ts  # TOTP + QR 全套
+│   ├── dedupe.ts            # 去重（account::folder::uid）
+│   ├── scheduler.ts         # 定时同步调度
 │   ├── events.ts            # 主进程 → 渲染进程事件广播
-│   ├── autostart.ts         # 开机自启
-│   └── presets.ts           # 常见邮箱预设
+│   ├── presets.ts           # 常见邮箱预设（IMAP + SMTP）
+│   └── autostart.ts         # 开机自启
 ├── src/
-│   ├── main.tsx / App.tsx / theme.ts / api.ts / types.ts / constants.ts / format.ts
-│   ├── components/          # Sidebar / CodeCard / TotpCard / SourceForm / Toast / ...
-│   └── pages/               # Inbox / Sources / Authenticator / Settings
-└── tests/                   # vitest 单元测试（extractor / totp / dedupe）
+│   ├── main.tsx / App.tsx / theme.ts / api.ts / types.ts / constants.ts / format.ts / html.ts
+│   ├── components/          # Sidebar / AccountNav / FolderTree / MailList / MessageView / ...
+│   └── pages/               # Mail / Accounts / Authenticator / Settings
+└── tests/                   # vitest 单元测试（存储核心 / 净化 / 解析 / 迁移 / TOTP 等）
 ```
 
 ## 5. 环境要求
@@ -107,17 +141,21 @@ npm test
 
 ## 7. 核心功能
 
-1. **来源管理**：邮箱（IMAP，含 QQ/163/Gmail/Outlook 预设）、手机号（映射到邮箱转发规则）、
-   TOTP 验证器；支持启用/停用、编辑、删除、测试连接。
+1. **账户管理**：邮箱账户（IMAP 收信 + SMTP 发信 + 同步文件夹多选 + 签名），
+   含 QQ/163/Gmail/Outlook 预设；支持启用/停用、编辑、删除、测试 IMAP/SMTP 连接。
    邮箱支持两种认证方式：**密码 / 授权码**，以及 **Microsoft 账户 OAuth 2.0 登录**
-   （Outlook / Hotmail / Microsoft 365 —— 微软已停用 IMAP 密码登录，只能走 OAuth，
-   见 [`docs/microsoft-oauth-setup.md`](docs/microsoft-oauth-setup.md)）。
-2. **采集/同步**：IMAP 定时轮询（默认 60s，可配置 15s–10min）+ 手动“立即同步”；
-   邮件解析 → 提取验证码 → 去重（来源 + UID）→ 归属到对应来源。
-3. **统一收件箱**：时间线卡片、来源色标、验证码大字一键复制、置信度、有效期提示；
-   新验证码实时插入并高亮；支持搜索、按来源/类型/时间筛选、只看未读、标记已读、删除、清空。
-4. **验证器（TOTP）**：实时验证码卡片 + 环形倒计时，一键复制；支持导入/导出（导出含密钥需二次确认）。
-5. **设置**：主题切换、轮询间隔、开机自启、数据导入/导出、清空全部数据、隐私与合规说明、关于页。
+   （见 [`docs/microsoft-oauth-setup.md`](docs/microsoft-oauth-setup.md)）。
+2. **邮件同步**：IMAP 定时轮询（默认 60s，可配置 15s–10min）+ 手动“立即同步”；
+   列文件夹 → 按 `UIDVALIDITY`/`lastUid` 增量收取订阅文件夹 → **无条件全量入库**
+   （正文落盘、附件存元数据、验证码降级为高亮）。
+3. **三栏阅读**：账户/文件夹树 + 邮件列表 + 阅读区。搜索、快捷筛选（全部/未读/有附件/验证码）、
+   已读/未读、移动、删除、附件按需下载；正文走沙箱 iframe，远程图片可手动放行。
+4. **写信**：新邮件 / 回复 / 转发（自动预填引用），存草稿、发信；Outlook 首次发信按需重授权。
+5. **验证码高亮**：列表与正文中高亮识别到的验证码并支持一键复制；**不影响入库**。
+6. **验证器（TOTP）**：实时验证码卡片 + 环形倒计时、一键复制；新增/编辑/删除、扫码录入、
+   导入/导出（导出含密钥需二次确认）。
+7. **设置**：主题、同步间隔、阅读偏好（HTML/纯文本、外部图片、附件目录）、开机自启、
+   数据导入/导出、清空全部数据、隐私与合规说明、关于页。
 
 ## 8. 验证码提取引擎
 
@@ -128,15 +166,17 @@ npm test
 - 打分：与关键词的距离 + 长度启发式 + 有效期提示；
 - 干扰项惩罚：货币金额（¥/$）、年份、超长订单号等。
 
-返回结构：`{ code, confidence, matchedKeyword, expiresAtHint }`。
+返回结构：`{ code, confidence, matchedKeyword, expiresAtHint }`。`MIN_CONFIDENCE` 仅决定
+**是否高亮 / 是否显示一键复制**，不再决定是否入库。
 
 ## 9. 已知限制
 
 - 未实现 Android/iOS 采集端（按要求忽略）。
 - 邮箱密码不做备份导出（恢复后需重新填写），仅 TOTP 密钥可选明文导出。
 - **Microsoft 账户必须走 OAuth**：微软自 2022 年起停用了 IMAP 基本验证，
-  服务器直接返回 `LOGINDISABLED`，网页密码与应用密码均不可用。使用前需先注册一个
-  免费 Azure 应用，步骤见 [`docs/microsoft-oauth-setup.md`](docs/microsoft-oauth-setup.md)。
-  刷新令牌不随备份导出，恢复备份后需重新授权一次。
-- IMAP 收取为“拉取最近 N 封”策略，去重依赖 UID；若邮件在服务端被移动/删除，历史记录仍保留在本地。
-- 提取引擎为启发式实现，覆盖主流短信/邮件模板，不保证 100% 准确。
+  服务器直接返回 `LOGINDISABLED`。**发信额外需要 `SMTP.Send` scope**，若账户是在
+  旧版本授权、缺少该 scope，首次发信时应用会提示重新登录一次。
+  步骤见 [`docs/microsoft-oauth-setup.md`](docs/microsoft-oauth-setup.md)。
+- 发信副本依赖服务器自身写入 Sent 文件夹；本地仅在索引补插一条已发送记录，不做 IMAP `APPEND`。
+- 正文搜索为**按需扫描**（并发/结果上限/渐进返回），不承诺全文索引级即时性。
+- 提取引擎为启发式实现，覆盖主流验证码模板，不保证 100% 准确。

@@ -1,4 +1,4 @@
-import type { CaptchaHubApi } from '../shared/types';
+import type { MailHubApi } from '../shared/types';
 
 /**
  * Typed accessor for the preload bridge. The global `window.api` shape is
@@ -8,8 +8,8 @@ import type { CaptchaHubApi } from '../shared/types';
 
 declare global {
   interface Window {
-    api: CaptchaHubApi;
+    api: MailHubApi;
   }
 }
 
-export const api: CaptchaHubApi = window.api;
+export const api: MailHubApi = window.api;

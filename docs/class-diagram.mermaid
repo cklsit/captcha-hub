@@ -1,0 +1,261 @@
+classDiagram
+  class Account {
+    +string id
+    +string name
+    +boolean enabled
+    +string emailAddress
+    +string displayName
+    +ImapCredentials imap
+    +SmtpCredentials smtp
+    +string[] syncFolders
+    +string signature
+    +string[] scopes
+    +boolean needsReauth
+    +number createdAt
+    +number updatedAt
+    +number|null lastSyncAt
+    +SyncStatus lastSyncStatus
+    +string|null lastSyncError
+  }
+  class ImapCredentials {
+    +string host
+    +number port
+    +boolean secure
+    +string username
+    +string password
+    +string authType
+    +string clientId
+    +string tenant
+    +string refreshToken
+    +string accessToken
+    +number accessTokenExpiresAt
+  }
+  class SmtpCredentials {
+    +string host
+    +number port
+    +boolean secure
+    +string username
+    +string password
+    +string authType
+  }
+  class Folder {
+    +string id
+    +string accountId
+    +string path
+    +string name
+    +string delimiter
+    +string specialUse
+    +number unreadCount
+    +number totalCount
+    +boolean subscribed
+    +number|null lastSyncAt
+    +number uidValidity
+  }
+  class TotpEntry {
+    +string id
+    +string name
+    +boolean enabled
+    +boolean createdAt
+    +TotpSecret totp
+  }
+  class Envelope {
+    +string id
+    +string accountId
+    +string folderId
+    +string uid
+    +string messageId
+    +string subject
+    +string from
+    +string to
+    +string cc
+    +string replyTo
+    +string snippet
+    +number receivedAt
+    +number ingestedAt
+    +MessageFlags flags
+    +boolean hasAttachments
+    +AttachmentMeta[] attachments
+    +CodeHighlight highlight
+    +boolean bodyTruncated
+  }
+  class MailMessage {
+    +string id
+    +Envelope envelope
+    +string bodyText
+    +string bodyHtml
+  }
+  class MessageFlags {
+    +boolean seen
+    +boolean flagged
+    +boolean answered
+    +boolean draft
+  }
+  class AttachmentMeta {
+    +string partId
+    +string filename
+    +string contentType
+    +number size
+    +boolean inline
+  }
+  class CodeHighlight {
+    +string code
+    +number confidence
+    +string matchedKeyword
+    +number expiresAtHint
+  }
+  class Draft {
+    +string id
+    +string accountId
+    +string mode
+    +string inReplyTo
+    +string to
+    +string cc
+    +string subject
+    +string bodyText
+    +string bodyHtml
+    +string[] attachments
+    +number updatedAt
+  }
+  class MessageFilter {
+    +string search
+    +string accountId
+    +string folderId
+    +boolean unreadOnly
+    +boolean hasAttachments
+    +boolean captchaOnly
+    +number sinceMs
+    +number limit
+    +number offset
+  }
+  class ComposePayload {
+    +string accountId
+    +string to
+    +string cc
+    +string subject
+    +string bodyText
+    +string bodyHtml
+    +string[] attachments
+    +string inReplyTo
+    +string mode
+  }
+  class AppSettings {
+    +string theme
+    +number pollIntervalSec
+    +boolean launchOnStartup
+    +boolean pinRecent
+    +string bodyRenderMode
+    +boolean allowRemoteImages
+    +string attachmentDir
+    +boolean desktopNotifications
+    +boolean migratedFromV1
+    +string migrationNotice
+  }
+  class ConfigStore {
+    +listAccounts()
+    +getAccount(id)
+    +createAccount(input)
+    +updateAccount(id, input)
+    +deleteAccount(id)
+    +setAccountEnabled(id, enabled)
+    +setAccountSyncResult(id,status,error,at)
+    +updateAccountTokens(id, tokens, scopes)
+    +listTotpEntries()
+    +createTotpEntry(input)
+    +getSettings()
+    +updateSettings(patch)
+    +exportBackup()
+    +importBackup(bundle)
+  }
+  class MailStoreCore {
+    +constructor(rootDir)
+    +loadIndex()
+    +listEnvelopes(filter)
+    +getEnvelope(id)
+    +upsertEnvelopes(accountId, folderId, envelopes, bodies)
+    +writeBody(accountId, folderId, uid, body)
+    +readBody(accountId, folderId, uid)
+    +setFlags(id, flags)
+    +moveMessage(id, targetFolderId, targetUid)
+    +deleteMessage(id)
+    +folderCounts(accountId)
+    +scanBodies(filter, options, onBatch)
+    +saveDraft(input)
+    +listDrafts(accountId)
+    +deleteDraft(id)
+    +safeSegment(segment)
+  }
+  class MailService {
+    +constructor(userDataDir)
+    +store() MailStoreCore
+  }
+  class ImapService {
+    +testConnection(credentials)
+    +listFolders(credentials)
+    +fetchFolder(credentials, folderPath, sinceUid, limit)
+    +setSeen(credentials, folderPath, uids, seen)
+    +moveMessage(credentials, folderPath, uid, targetPath)
+    +deleteMessage(credentials, folderPath, uid)
+    +fetchAttachment(credentials, folderPath, uid, partId)
+    +announceClientId(client, host)
+    +describeImapError(error, host)
+  }
+  class SmtpService {
+    +verify(credentials)
+    +send(payload, credentials)
+    +buildReply(message)
+    +buildForward(message)
+  }
+  class SyncService {
+    +syncAccount(account)
+    +syncAll(accountId)
+    +getSyncStatus()
+  }
+  class AttachmentService {
+    +download(messageId, partId)
+  }
+  class DraftService {
+    +save(input)
+    +list(accountId)
+    +remove(id)
+    +buildReplyPrefill(messageId)
+    +buildForwardPrefill(messageId)
+  }
+  class Sanitizer {
+    +sanitizeMailHtml(html, opts)
+  }
+  class Extractor {
+    +extractCode(input, now)
+    +MIN_CONFIDENCE
+  }
+  class HistoryMigration {
+    +migrateV1ToV2(oldJson)
+  }
+
+  Account "1" *-- "1" ImapCredentials
+  Account "1" *-- "0..1" SmtpCredentials
+  Account "1" o-- "*" Folder
+  Envelope "*" --> "1" Account
+  Envelope "*" --> "1" Folder
+  Envelope "1" *-- "1" MessageFlags
+  Envelope "1" *-- "*" AttachmentMeta
+  Envelope "1" o-- "0..1" CodeHighlight
+  MailMessage "1" -- "1" Envelope
+  Draft "*" --> "1" Account
+
+  ConfigStore ..> Account
+  ConfigStore ..> TotpEntry
+  ConfigStore ..> Envelope
+  MailStoreCore ..> Envelope
+  MailStoreCore ..> Draft
+  MailService ..> MailStoreCore
+  SyncService ..> ImapService
+  SyncService ..> Extractor
+  SyncService ..> Sanitizer
+  SyncService ..> MailStoreCore
+  SyncService ..> ConfigStore
+  AttachmentService ..> ImapService
+  AttachmentService ..> MailStoreCore
+  DraftService ..> MailStoreCore
+  SmtpService ..> ConfigStore
+  HistoryMigration ..> ConfigStore
+  HistoryMigration ..> MailStoreCore

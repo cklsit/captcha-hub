@@ -69,7 +69,7 @@ function srcFiles(): string[] {
 }
 
 describe('QA IPC contract — preload vs ipcMain handlers', () => {
-  const preload = parseApiBlock(read('electron/preload.ts'), 'const api: CaptchaHubApi = {');
+  const preload = parseApiBlock(read('electron/preload.ts'), 'const api: MailHubApi = {');
   const ipc = read('electron/ipc.ts');
 
   const preloadInvokeChannels = new Set(
@@ -81,8 +81,8 @@ describe('QA IPC contract — preload vs ipcMain handlers', () => {
   const handleChannels = new Set(matchAll(ipc, /ipcMain\.handle\(\s*'([^']+)'/g));
 
   it('parsed a non-trivial number of channels from both sides', () => {
-    expect(preloadInvokeChannels.size).toBeGreaterThanOrEqual(20);
-    expect(handleChannels.size).toBeGreaterThanOrEqual(20);
+    expect(preloadInvokeChannels.size).toBeGreaterThanOrEqual(30);
+    expect(handleChannels.size).toBeGreaterThanOrEqual(30);
   });
 
   it('every preload invoke channel has a matching ipcMain.handle', () => {
@@ -103,11 +103,11 @@ describe('QA IPC contract — preload vs ipcMain handlers', () => {
   });
 });
 
-describe('QA IPC contract — preload vs shared CaptchaHubApi interface', () => {
-  const declared = parseApiBlock(read('shared/types.ts'), 'export interface CaptchaHubApi {');
-  const preload = parseApiBlock(read('electron/preload.ts'), 'const api: CaptchaHubApi = {');
+describe('QA IPC contract — preload vs shared MailHubApi interface', () => {
+  const declared = parseApiBlock(read('shared/types.ts'), 'export interface MailHubApi {');
+  const preload = parseApiBlock(read('electron/preload.ts'), 'const api: MailHubApi = {');
 
-  it('preload exposes exactly the members declared in CaptchaHubApi', () => {
+  it('preload exposes exactly the members declared in MailHubApi', () => {
     const declaredKeys = [...declared.keys()].sort();
     const exposedKeys = [...preload.keys()].sort();
     expect(exposedKeys).toEqual(declaredKeys);
@@ -115,7 +115,7 @@ describe('QA IPC contract — preload vs shared CaptchaHubApi interface', () => 
 });
 
 describe('QA IPC contract — renderer call sites vs exposed bridge', () => {
-  const preload = parseApiBlock(read('electron/preload.ts'), 'const api: CaptchaHubApi = {');
+  const preload = parseApiBlock(read('electron/preload.ts'), 'const api: MailHubApi = {');
   const exposed = new Set(preload.keys());
 
   const used = new Set<string>();
@@ -159,9 +159,11 @@ describe('QA security baseline — static checks', () => {
     expect(block).not.toMatch(/\bsecret\b/);
   });
 
-  it('sensitive source fields are encrypted at rest via crypto.encryptString', () => {
+  it('sensitive account fields are encrypted at rest via crypto.encryptString', () => {
     const store = read('electron/store.ts');
-    expect(store).toMatch(/encryptString\(next\.email\.password\)/);
+    expect(store).toMatch(/encryptString\(next\.imap\.password\)/);
+    expect(store).toMatch(/encryptString\(next\.imap\.refreshToken\)/);
+    expect(store).toMatch(/encryptString\(next\.smtp\.password\)/);
     expect(store).toMatch(/encryptString\(next\.totp\.secret\)/);
   });
 });

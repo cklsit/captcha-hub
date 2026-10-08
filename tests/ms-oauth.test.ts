@@ -5,11 +5,15 @@ import {
   clearPendingLogins,
   deviceCodeEndpoint,
   getPendingTokens,
+  hasScope,
   isAccessTokenFresh,
   MS_DEFAULT_TENANT,
   MS_IMAP_SCOPE,
+  MS_SCOPES,
+  MS_SMTP_SCOPE,
   msAuthority,
   parseDeviceCodeResponse,
+  parseScopes,
   parseTokenResponse,
   pendingLoginCount,
   pollLogin,
@@ -94,8 +98,19 @@ describe('parseDeviceCodeResponse', () => {
 describe('parseTokenResponse', () => {
   it('按 expires_in 计算绝对过期时间', () => {
     const now = 1_700_000_000_000;
-    expect(parseTokenResponse({ access_token: 'AT', refresh_token: 'RT', expires_in: 3600 }, now))
-      .toEqual({ accessToken: 'AT', refreshToken: 'RT', expiresAt: now + 3_600_000 });
+    const parsed = parseTokenResponse(
+      { access_token: 'AT', refresh_token: 'RT', expires_in: 3600, scope: 'offline_access ' + MS_IMAP_SCOPE },
+      now,
+    );
+    expect(parsed?.accessToken).toBe('AT');
+    expect(parsed?.refreshToken).toBe('RT');
+    expect(parsed?.expiresAt).toBe(now + 3_600_000);
+    expect(parsed?.scopes).toEqual(['offline_access', MS_IMAP_SCOPE]);
+  });
+
+  it('服务器未回传 scope 时回落到申请集合（避免永久要求重授权）', () => {
+    const parsed = parseTokenResponse({ access_token: 'AT' }, 0);
+    expect(parsed?.scopes).toEqual([...MS_SCOPES]);
   });
 
   it('缺少 access_token 时返回 null', () => {
@@ -107,6 +122,18 @@ describe('parseTokenResponse', () => {
     const now = 0;
     expect(parseTokenResponse({ access_token: 'AT' }, now)?.expiresAt).toBe(3_600_000);
     expect(parseTokenResponse({ access_token: 'AT', expires_in: 'x' }, now)?.expiresAt).toBe(3_600_000);
+  });
+});
+
+describe('parseScopes / hasScope', () => {
+  it('拆分空格分隔的 scope', () => {
+    expect(parseScopes('a b  c')).toEqual(['a', 'b', 'c']);
+    expect(parseScopes(undefined)).toEqual([]);
+  });
+
+  it('大小写不敏感地判断是否包含某个 scope', () => {
+    expect(hasScope([MS_IMAP_SCOPE], MS_IMAP_SCOPE.toUpperCase())).toBe(true);
+    expect(hasScope([MS_IMAP_SCOPE], MS_SMTP_SCOPE)).toBe(false);
   });
 });
 
@@ -188,5 +215,12 @@ describe('待处理登录注册表', () => {
 describe('请求的权限范围', () => {
   it('同时申请 IMAP 访问与 offline_access（否则拿不到刷新令牌）', () => {
     expect(MS_IMAP_SCOPE).toBe('https://outlook.office.com/IMAP.AccessAsUser.All');
+  });
+
+  it('v2 起额外申请 SMTP.Send 以便发信', () => {
+    expect(MS_SMTP_SCOPE).toBe('https://outlook.office.com/SMTP.Send');
+    expect(MS_SCOPES).toContain(MS_IMAP_SCOPE);
+    expect(MS_SCOPES).toContain(MS_SMTP_SCOPE);
+    expect(MS_SCOPES).toContain('offline_access');
   });
 });

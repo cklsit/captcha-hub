@@ -23,7 +23,7 @@ describe('announceClientId', () => {
       await announceClientId(fakeClient(run), host);
       expect(run, host).toHaveBeenCalledTimes(1);
       expect(run.mock.calls[0][0], host).toBe('ID');
-      expect(run.mock.calls[0][1]).toMatchObject({ name: 'Captcha Hub' });
+      expect(run.mock.calls[0][1]).toMatchObject({ name: 'Mail Hub' });
     }
   });
 
@@ -129,7 +129,8 @@ describe('describeImapError：只接受 OAuth 的 Microsoft 主机', () => {
       'outlook.office365.com',
     );
     expect(result).toContain('OAuth');
-    expect(result).toContain('转发');
+    // v2 起提示改为「改用 OAuth 授权登录」的口径（不再引导用户转发到其它邮箱）。
+    expect(result).toContain('授权');
     expect(result).not.toContain('密码不正确');
   });
 

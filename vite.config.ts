@@ -5,11 +5,14 @@ import path from 'node:path';
 
 /**
  * Third-party runtime modules are marked external so they are `require`d at
- * runtime from node_modules (they contain native/dynamic requires that do not
- * bundle cleanly). They are declared in package.json "dependencies" so
+ * runtime from node_modules (they contain dynamic requires that do not bundle
+ * cleanly). They are declared in package.json "dependencies" so
  * electron-builder ships them inside the packaged app.
+ *
+ * `nodemailer` is the only addition over the previous build; the project ships
+ * ZERO native modules (see README) so there is nothing else to externalise.
  */
-const externalDeps = ['electron', 'imapflow', 'mailparser', 'otplib', 'electron-store'];
+const externalDeps = ['electron', 'imapflow', 'mailparser', 'otplib', 'electron-store', 'nodemailer'];
 
 export default defineConfig({
   resolve: {

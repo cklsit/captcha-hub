@@ -2,6 +2,7 @@ import { app, BrowserWindow, shell } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs';
 import { registerIpc } from './ipc';
+import { migrate } from './migrate';
 import { applyLoginItem } from './autostart';
 import { startScheduler, stopScheduler } from './scheduler';
 import { getSettings } from './store';
@@ -32,7 +33,7 @@ function createWindow(): void {
     minHeight: 640,
     show: false,
     backgroundColor: '#0f1115',
-    title: '验证码收件箱 · Captcha Hub',
+    title: '邮件中心 · Mail Hub',
     autoHideMenuBar: true,
     webPreferences: {
       preload: resolvePreloadPath(),
@@ -74,6 +75,13 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(() => {
+    // Upgrade any v1 "Captcha Hub" data before anything reads the new store.
+    try {
+      migrate();
+    } catch {
+      /* a migration failure must never block startup */
+    }
+
     registerIpc();
     createWindow();
 

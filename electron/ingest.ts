@@ -1,28 +1,38 @@
-import { randomUUID } from 'node:crypto';
-import { fetchRecentMails, describeImapError } from './imap';
+import { describeImapError, fetchFolder, listFolders } from './imap';
 import { ensureFreshCredentials } from './mail-auth';
-import { extractCode, isIngestible, resolveSourceForMail } from './extractor';
+import { extractCode } from './extractor';
+import { sanitizeMailHtml } from './sanitize';
+import { buildEnvelope, buildHighlight } from './ingest-core';
 import { broadcast } from './events';
+import { getStore } from './mail-service';
 import * as store from './store';
-import type { CaptchaMessage, Source, SourceSyncResult, SyncResult, SyncStatusInfo } from '../shared/types';
+import type {
+  Account,
+  AccountSyncResult,
+  Envelope,
+  Folder,
+  SyncResult,
+  SyncStatusInfo,
+} from '../shared/types';
 
 /**
- * Ingestion service: fetch mails -> extract codes -> attribute to a source ->
- * persist -> notify the renderer. Runs one source at a time to avoid hammering
- * a single mailbox with parallel connections.
+ * SyncService — the ingestion orchestrator.
+ *
+ * v2 behaviour: for every enabled account it lists the server folders, then for
+ * each *subscribed* folder pulls everything newer than the stored UID cursor and
+ * stores it **unconditionally**. The verification-code extractor's result is
+ * demoted to highlight metadata; it never gates ingestion, and there is no
+ * "only after account creation" baseline any more.
+ *
+ * Runs one account at a time to avoid hammering a single mailbox with parallel
+ * connections.
  */
 
-const FETCH_LIMIT = 30;
-const SUMMARY_LENGTH = 180;
+const FETCH_LIMIT = 500;
+const DEFAULT_FOLDERS = ['INBOX'];
 
 let syncing = false;
 let lastRun: SyncResult | null = null;
-
-function summarize(text: string): string {
-  const clean = text.replace(/\s+/g, ' ').trim();
-  if (clean.length <= SUMMARY_LENGTH) return clean;
-  return `${clean.slice(0, SUMMARY_LENGTH)}…`;
-}
 
 export function isSyncing(): boolean {
   return syncing;
@@ -36,72 +46,107 @@ export function getSyncStatus(): SyncStatusInfo {
   return { syncing, lastRun };
 }
 
-export async function syncSource(source: Source): Promise<SourceSyncResult> {
-  if (source.kind !== 'email' || !source.email || !source.enabled) {
-    return { sourceId: source.id, sourceName: source.name, added: 0, error: null };
-  }
+function subscribedSet(account: Account): Set<string> {
+  const paths = account.syncFolders.length > 0 ? account.syncFolders : DEFAULT_FOLDERS;
+  return new Set(paths);
+}
+
+/** Syncs one account across all of its subscribed folders. */
+export async function syncAccount(account: Account): Promise<AccountSyncResult> {
+  const empty: AccountSyncResult = {
+    accountId: account.id,
+    accountName: account.name,
+    added: 0,
+    folders: 0,
+    error: null,
+  };
+  if (!account.enabled) return empty;
+
+  const core = getStore();
 
   try {
-    // OAuth sources transparently refresh their access token here; password
-    // sources come back untouched.
-    const credentials = await ensureFreshCredentials(source);
-    const mails = await fetchRecentMails(credentials, FETCH_LIMIT);
-    const allSources = store.getSources();
-    const collected: CaptchaMessage[] = [];
+    const credentials = await ensureFreshCredentials(account);
+    const serverFolders = await listFolders(credentials);
+    const stored: Folder[] = core.saveFolders(account.id, serverFolders);
+    broadcast('folders:changed', account.id);
 
-    for (const mail of mails) {
-      const receivedAt = mail.date.getTime();
+    const wanted = subscribedSet(account);
+    const inserted: Envelope[] = [];
+    let folderCount = 0;
 
-      const extracted = extractCode({ subject: mail.subject, text: mail.text, from: mail.from });
-      if (!extracted) continue;
+    for (const folder of serverFolders) {
+      if (!wanted.has(folder.path)) continue;
+      folderCount += 1;
 
-      const resolved = resolveSourceForMail(
-        { subject: mail.subject, from: mail.from, text: mail.text },
-        source.id,
-        allSources,
+      const record = stored.find((entry) => entry.path === folder.path);
+      const result = await fetchFolder(
+        credentials,
+        folder.path,
+        record?.lastUid ?? 0,
+        FETCH_LIMIT,
+        record?.uidValidity ?? 0,
       );
-      if (!resolved) continue;
 
-      // The mailbox source's own creation time, plus — for mail claimed by a
-      // phone forwarding rule — the moment that rule was created, so a rule
-      // added later cannot retroactively claim older messages.
-      const baseline = Math.max(source.createdAt, resolved.source.createdAt);
-      if (!isIngestible(receivedAt, baseline, extracted.confidence)) continue;
+      const folderEnvelopes: Envelope[] = [];
+      for (const mail of result.mails) {
+        const extracted = extractCode({
+          subject: mail.parsed.subject,
+          text: mail.parsed.text,
+          from: mail.parsed.from,
+        });
+        const envelope = buildEnvelope({
+          accountId: account.id,
+          folderId: folder.path,
+          uid: mail.uid,
+          parsed: mail.parsed,
+          highlight: buildHighlight(extracted),
+          seen: mail.seen,
+        });
+        core.writeBody(account.id, folder.path, mail.uid, {
+          text: mail.parsed.text,
+          html: mail.parsed.html,
+          // Keep image URLs in the stored HTML (structure is still sanitised);
+          // the reading pane's sandboxed iframe CSP decides at render time
+          // whether remote images may actually load. This is the "double
+          // insurance": strip execution now, gate the network later.
+          safeHtml: sanitizeMailHtml(mail.parsed.html, { allowRemoteImages: true }),
+        });
+        folderEnvelopes.push(envelope);
+      }
 
-      collected.push({
-        id: randomUUID(),
-        sourceId: resolved.source.id,
-        sourceKind: resolved.source.kind,
-        sourceName: resolved.source.name,
-        code: extracted.code,
-        confidence: extracted.confidence,
-        matchedKeyword: extracted.matchedKeyword,
-        expiresAtHint: extracted.expiresAtHint,
-        subject: mail.subject || '(无主题)',
-        from: mail.from || '(未知发件人)',
-        summary: summarize(mail.text),
-        receivedAt,
-        ingestedAt: Date.now(),
-        read: false,
-        uid: mail.uid,
+      if (folderEnvelopes.length > 0) {
+        const { added } = core.upsertEnvelopes(folderEnvelopes);
+        inserted.push(...added);
+      }
+
+      core.updateFolderCursor(account.id, record?.id ?? `${account.id}::${folder.path}`, {
+        uidValidity: result.uidValidity,
+        lastUid: result.lastUid,
+        lastSyncAt: Date.now(),
       });
+      broadcast('folders:changed', account.id);
     }
 
-    const { addedCount, inserted } = store.addMessages(collected);
-    store.setSourceSyncResult(source.id, 'ok', null, Date.now());
-    if (inserted.length > 0) {
-      broadcast('inbox:new', inserted);
-    }
-    return { sourceId: source.id, sourceName: source.name, added: addedCount, error: null };
+    store.setAccountSyncResult(account.id, 'ok', null, Date.now());
+    if (inserted.length > 0) broadcast('mail:new', inserted);
+
+    return {
+      accountId: account.id,
+      accountName: account.name,
+      added: inserted.length,
+      folders: folderCount,
+      error: null,
+    };
   } catch (error) {
-    const message = describeImapError(error, source.email?.host ?? '');
-    store.setSourceSyncResult(source.id, 'error', message, Date.now());
-    return { sourceId: source.id, sourceName: source.name, added: 0, error: message };
+    const message =
+      error instanceof Error ? describeImapError(error, account.imap.host) : String(error);
+    store.setAccountSyncResult(account.id, 'error', message, Date.now());
+    return { accountId: account.id, accountName: account.name, added: 0, folders: 0, error: message };
   }
 }
 
-/** Syncs every enabled email source. Phone sources derive from them. */
-export async function syncAll(): Promise<SyncResult> {
+/** Syncs every enabled account, or a single one when `accountId` is given. */
+export async function syncAll(accountId?: string): Promise<SyncResult> {
   if (syncing) {
     return lastRun ?? { startedAt: Date.now(), finishedAt: Date.now(), totalAdded: 0, results: [] };
   }
@@ -111,10 +156,13 @@ export async function syncAll(): Promise<SyncResult> {
 
   const startedAt = Date.now();
   try {
-    const emailSources = store.getSources().filter((source) => source.kind === 'email' && source.enabled);
-    const results: SourceSyncResult[] = [];
-    for (const source of emailSources) {
-      results.push(await syncSource(source));
+    const accounts = store
+      .getAccounts()
+      .filter((account) => account.enabled && (accountId ? account.id === accountId : true));
+
+    const results: AccountSyncResult[] = [];
+    for (const account of accounts) {
+      results.push(await syncAccount(account));
     }
 
     const result: SyncResult = {

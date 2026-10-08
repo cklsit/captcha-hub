@@ -7,43 +7,49 @@ import CircularProgress from '@mui/material/CircularProgress';
 import CssBaseline from '@mui/material/CssBaseline';
 import { ThemeProvider } from '@mui/material/styles';
 import Typography from '@mui/material/Typography';
+import CloseIcon from '@mui/icons-material/Close';
+import EditNoteOutlinedIcon from '@mui/icons-material/EditNoteOutlined';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import SyncIcon from '@mui/icons-material/Sync';
 import type {
+  AccountInput,
+  AccountPreset,
   AppSettings,
-  CaptchaMessage,
+  ComposePayload,
   ConnectionTestResult,
-  SafeSource,
-  SourceInput,
+  Envelope,
+  Folder,
+  MailMessage,
+  MessageFilter,
+  SafeAccount,
 } from '../shared/types';
 import { api } from './api';
+import { Accounts } from './pages/Accounts';
+import { Authenticator } from './pages/Authenticator';
+import { Mail } from './pages/Mail';
+import { Settings } from './pages/Settings';
+import { ConfirmDialog } from './components/ConfirmDialog';
 import { Sidebar } from './components/Sidebar';
 import { ToastProvider, useToast } from './components/Toast';
 import { DEFAULT_APP_SETTINGS } from './constants';
 import { formatRelative } from './format';
-import { Authenticator } from './pages/Authenticator';
-import { Inbox } from './pages/Inbox';
-import { Settings } from './pages/Settings';
-import { Sources } from './pages/Sources';
 import { buildTheme } from './theme';
-import type { ViewKey } from './types';
+import type { MailSelection, ViewKey } from './types';
 
 const HIGHLIGHT_DURATION_MS = 6000;
 
-/** Client-side merge that keeps the inbox sorted and free of duplicates. */
-function mergeClient(existing: CaptchaMessage[], incoming: CaptchaMessage[]): CaptchaMessage[] {
-  const ids = new Set(existing.map((message) => message.id));
-  const added = incoming.filter((message) => !ids.has(message.id));
-  if (added.length === 0) return existing;
-  return [...added, ...existing].sort((a, b) => b.receivedAt - a.receivedAt);
-}
-
 const VIEW_TITLES: Record<ViewKey, string> = {
-  inbox: '统一收件箱',
-  sources: '来源管理',
+  mail: '邮件',
   authenticator: '验证器',
   settings: '设置',
 };
+
+const EMPTY_SELECTION: MailSelection = { accountId: 'all', folderId: 'all' };
+
+/** Merges the current account/folder selection with the quick-filter state. */
+function buildFilter(selection: MailSelection, filter: MessageFilter): MessageFilter {
+  return { ...filter, accountId: selection.accountId, folderId: selection.folderId };
+}
 
 interface ShellProps {
   settings: AppSettings;
@@ -53,16 +59,28 @@ interface ShellProps {
 
 function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): JSX.Element {
   const toast = useToast();
-  const [view, setView] = useState<ViewKey>('inbox');
-  const [sources, setSources] = useState<SafeSource[]>([]);
-  const [messages, setMessages] = useState<CaptchaMessage[]>([]);
-  const [presets, setPresets] = useState<Awaited<ReturnType<typeof api.sources.presets>>>([]);
+  const [view, setView] = useState<ViewKey>('mail');
+  const [accountsOpen, setAccountsOpen] = useState(false);
+  const [accounts, setAccounts] = useState<SafeAccount[]>([]);
+  const [presets, setPresets] = useState<AccountPreset[]>([]);
+  const [foldersByAccount, setFoldersByAccount] = useState<Record<string, Folder[]>>({});
+  const [envelopes, setEnvelopes] = useState<Envelope[]>([]);
+  const [selection, setSelection] = useState<MailSelection>(EMPTY_SELECTION);
+  const [filter, setFilter] = useState<MessageFilter>({});
+  const [selectedMessage, setSelectedMessage] = useState<MailMessage | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<Envelope | null>(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
   const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
+  const [totpCount, setTotpCount] = useState(0);
   const [highlightIds, setHighlightIds] = useState<Set<string>>(() => new Set());
+  const [downloadingPartId, setDownloadingPartId] = useState<string | null>(null);
+  const [composeOpen, setComposeOpen] = useState(false);
+  const [composeInitial, setComposeInitial] = useState<ComposePayload | null>(null);
   const highlightTimers = useRef<Map<string, number>>(new Map());
+
+  /* -------------------------------------------------------------- highlights */
 
   const pushHighlights = useCallback((ids: string[]) => {
     if (ids.length === 0) return;
@@ -86,63 +104,331 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
     });
   }, []);
 
-  const loadMessages = useCallback(async () => {
-    const list = await api.messages.list();
-    setMessages(list);
+  /* ------------------------------------------------------------------ loaders */
+
+  const loadAccounts = useCallback(async () => {
+    setAccounts(await api.accounts.list());
   }, []);
 
-  const loadSources = useCallback(async () => {
-    const list = await api.sources.list();
-    setSources(list);
+  const loadFolders = useCallback(async () => {
+    const list = await api.folders.list();
+    const grouped: Record<string, Folder[]> = {};
+    for (const folder of list) {
+      (grouped[folder.accountId] ??= []).push(folder);
+    }
+    setFoldersByAccount(grouped);
   }, []);
 
-  const reloadAll = useCallback(async () => {
-    await Promise.all([loadSources(), loadMessages()]);
-  }, [loadMessages, loadSources]);
+  const loadEnvelopes = useCallback(async () => {
+    setLoading(true);
+    try {
+      setEnvelopes(await api.messages.list(buildFilter(selection, filter)));
+    } finally {
+      setLoading(false);
+    }
+  }, [selection, filter]);
 
-  // Initial load + IPC subscriptions.
+  const refreshTotpCount = useCallback(async () => {
+    try {
+      setTotpCount((await api.totp.list()).length);
+    } catch {
+      /* count is cosmetic */
+    }
+  }, []);
+
+  /* ------------------------------------------------------------- subscriptions */
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const [sourceList, messageList, presetList, status] = await Promise.all([
-          api.sources.list(),
-          api.messages.list(),
-          api.sources.presets(),
+        const [accountList, presetList, folderList, status] = await Promise.all([
+          api.accounts.list(),
+          api.accounts.presets(),
+          api.folders.list(),
           api.sync.status(),
         ]);
         if (cancelled) return;
-        setSources(sourceList);
-        setMessages(messageList);
+        setAccounts(accountList);
         setPresets(presetList);
+        const grouped: Record<string, Folder[]> = {};
+        for (const folder of folderList) (grouped[folder.accountId] ??= []).push(folder);
+        setFoldersByAccount(grouped);
         setSyncing(status.syncing);
         if (status.lastRun) setLastSyncAt(status.lastRun.finishedAt);
       } catch (error) {
-        if (!cancelled) {
-          setBootError(error instanceof Error ? error.message : String(error));
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) setBootError(error instanceof Error ? error.message : String(error));
       }
     })();
-
-    const offNew = api.on.newMessages((incoming) => {
-      setMessages((prev) => mergeClient(prev, incoming));
-      pushHighlights(incoming.map((message) => message.id));
-    });
-    const offSync = api.on.syncState((state) => {
-      setSyncing(state.syncing);
-      if (!state.syncing && state.lastRun) {
-        setLastSyncAt(state.lastRun.finishedAt);
-      }
-    });
+    void refreshTotpCount();
 
     return () => {
       cancelled = true;
+    };
+  }, [refreshTotpCount]);
+
+  useEffect(() => {
+    void loadEnvelopes();
+  }, [loadEnvelopes]);
+
+  useEffect(() => {
+    const offNew = api.on.newMessages((incoming) => {
+      pushHighlights(incoming.map((envelope) => envelope.id));
+      void loadFolders();
+      void loadEnvelopes();
+    });
+    const offSync = api.on.syncState((state) => {
+      setSyncing(state.syncing);
+      if (!state.syncing && state.lastRun) setLastSyncAt(state.lastRun.finishedAt);
+    });
+    const offFolders = api.on.foldersChanged(() => {
+      void loadFolders();
+    });
+
+    return () => {
       offNew();
       offSync();
+      offFolders();
     };
-  }, [pushHighlights]);
+  }, [loadEnvelopes, loadFolders, pushHighlights]);
+
+  /* ---------------------------------------------------------------- selection */
+
+  const handleSelectAll = useCallback(() => {
+    setSelection({ accountId: 'all', folderId: 'all' });
+    setSelectedMessage(null);
+  }, []);
+
+  const handleSelectAccount = useCallback((accountId: string) => {
+    setSelection({ accountId, folderId: 'all' });
+    setSelectedMessage(null);
+  }, []);
+
+  const handleSelectFolder = useCallback((accountId: string, folderId: string) => {
+    setSelection({ accountId, folderId });
+    setSelectedMessage(null);
+  }, []);
+
+  /* ---------------------------------------------------------------- messages */
+
+  const handleSelectEnvelope = useCallback(
+    (envelope: Envelope) => {
+      void (async () => {
+        try {
+          const message = await api.messages.get(envelope.id);
+          setSelectedMessage(message);
+          if (message && !envelope.flags.seen) {
+            await api.messages.setFlags(envelope.id, { seen: true });
+            setEnvelopes((prev) =>
+              prev.map((item) => (item.id === envelope.id ? { ...item, flags: { ...item.flags, seen: true } } : item)),
+            );
+            setSelectedMessage((prev) =>
+              prev ? { ...prev, envelope: { ...prev.envelope, flags: { ...prev.envelope.flags, seen: true } } } : prev,
+            );
+            void loadFolders();
+          }
+        } catch (error) {
+          toast(error instanceof Error ? error.message : String(error), 'error');
+        }
+      })();
+    },
+    [loadFolders, toast],
+  );
+
+  const handleToggleSeen = useCallback(
+    (seen: boolean) => {
+      const current = selectedMessage;
+      if (!current) return;
+      const id = current.envelope.id;
+      void (async () => {
+        try {
+          await api.messages.setFlags(id, { seen });
+          setEnvelopes((prev) =>
+            prev.map((item) => (item.id === id ? { ...item, flags: { ...item.flags, seen } } : item)),
+          );
+          setSelectedMessage((prev) => (prev ? { ...prev, envelope: { ...prev.envelope, flags: { ...prev.envelope.flags, seen } } } : prev));
+          void loadFolders();
+        } catch (error) {
+          toast(error instanceof Error ? error.message : String(error), 'error');
+        }
+      })();
+    },
+    [selectedMessage, loadFolders, toast],
+  );
+
+  const handleMove = useCallback(
+    (folderId: string) => {
+      const current = selectedMessage;
+      if (!current) return;
+      const id = current.envelope.id;
+      void (async () => {
+        try {
+          await api.messages.move(id, folderId);
+          setEnvelopes((prev) => prev.filter((item) => item.id !== id));
+          setSelectedMessage(null);
+          await loadFolders();
+          toast('已移动', 'success');
+        } catch (error) {
+          toast(error instanceof Error ? error.message : String(error), 'error');
+        }
+      })();
+    },
+    [selectedMessage, loadFolders, toast],
+  );
+
+  const confirmDelete = useCallback(() => {
+    const target = pendingDelete;
+    setPendingDelete(null);
+    if (!target) return;
+    void (async () => {
+      try {
+        await api.messages.remove(target.id);
+        setEnvelopes((prev) => prev.filter((item) => item.id !== target.id));
+        setSelectedMessage((prev) => (prev && prev.envelope.id === target.id ? null : prev));
+        await loadFolders();
+        toast('已删除', 'success');
+      } catch (error) {
+        toast(error instanceof Error ? error.message : String(error), 'error');
+      }
+    })();
+  }, [pendingDelete, loadFolders, toast]);
+
+  const handleMarkAllRead = useCallback(() => {
+    void (async () => {
+      try {
+        await api.messages.markAllRead(buildFilter(selection, filter));
+        setEnvelopes((prev) => prev.map((item) => ({ ...item, flags: { ...item.flags, seen: true } })));
+        void loadFolders();
+      } catch (error) {
+        toast(error instanceof Error ? error.message : String(error), 'error');
+      }
+    })();
+  }, [selection, filter, loadFolders, toast]);
+
+  const handleDownloadAttachment = useCallback(
+    (partId: string) => {
+      const current = selectedMessage;
+      if (!current) return;
+      const id = current.envelope.id;
+      setDownloadingPartId(partId);
+      void (async () => {
+        try {
+          const result = await api.attachments.download(id, partId);
+          if (result.saved) toast(`已保存到：${result.path ?? ''}`, 'success');
+          else toast(result.error ?? '附件下载失败', 'error');
+        } catch (error) {
+          toast(error instanceof Error ? error.message : String(error), 'error');
+        } finally {
+          setDownloadingPartId(null);
+        }
+      })();
+    },
+    [selectedMessage, toast],
+  );
+
+  /* ----------------------------------------------------------------- compose */
+
+  const openCompose = useCallback((prefill: ComposePayload | null) => {
+    setComposeInitial(prefill);
+    setComposeOpen(true);
+  }, []);
+
+  const handleReply = useCallback(() => {
+    const current = selectedMessage;
+    if (!current) return;
+    void (async () => {
+      const prefill = await api.compose.replyPrefill(current.envelope.id);
+      if (prefill) openCompose(prefill);
+      else toast('无法创建回复草稿。', 'error');
+    })();
+  }, [selectedMessage, openCompose, toast]);
+
+  const handleForward = useCallback(() => {
+    const current = selectedMessage;
+    if (!current) return;
+    void (async () => {
+      const prefill = await api.compose.forwardPrefill(current.envelope.id);
+      if (prefill) openCompose(prefill);
+      else toast('无法创建转发草稿。', 'error');
+    })();
+  }, [selectedMessage, openCompose, toast]);
+
+  const handleComposeSent = useCallback(() => {
+    void loadEnvelopes();
+    void loadFolders();
+    void loadAccounts();
+  }, [loadEnvelopes, loadFolders, loadAccounts]);
+
+  /* ------------------------------------------------------------------ sync */
+
+  const handleSyncNow = useCallback(async () => {
+    setSyncing(true);
+    try {
+      const result = await api.sync.now();
+      await Promise.all([loadAccounts(), loadFolders(), loadEnvelopes()]);
+      setLastSyncAt(result.finishedAt);
+      toast(result.totalAdded > 0 ? `同步完成，新增 ${result.totalAdded} 封邮件` : '同步完成，暂无新邮件', 'info');
+    } catch (error) {
+      toast(error instanceof Error ? error.message : String(error), 'error');
+    } finally {
+      setSyncing(false);
+    }
+  }, [loadAccounts, loadFolders, loadEnvelopes, toast]);
+
+  const handleRefresh = useCallback(async () => {
+    await Promise.all([loadAccounts(), loadFolders(), loadEnvelopes(), reloadSettings()]);
+  }, [loadAccounts, loadFolders, loadEnvelopes, reloadSettings]);
+
+  /* --------------------------------------------------------------- accounts CRUD */
+
+  const handleCreateAccount = useCallback(
+    async (input: AccountInput) => {
+      await api.accounts.create(input);
+      await Promise.all([loadAccounts(), loadFolders()]);
+      toast('账户已添加，正在后台同步…', 'success');
+    },
+    [loadAccounts, loadFolders, toast],
+  );
+
+  const handleUpdateAccount = useCallback(
+    async (id: string, input: AccountInput) => {
+      await api.accounts.update(id, input);
+      await Promise.all([loadAccounts(), loadFolders()]);
+      toast('账户已更新', 'success');
+    },
+    [loadAccounts, loadFolders, toast],
+  );
+
+  const handleDeleteAccount = useCallback(
+    async (id: string) => {
+      await api.accounts.remove(id);
+      await Promise.all([loadAccounts(), loadFolders(), loadEnvelopes()]);
+      setSelection((prev) => (prev.accountId === id ? EMPTY_SELECTION : prev));
+      setSelectedMessage((prev) => (prev && prev.envelope.accountId === id ? null : prev));
+      toast('账户已删除', 'success');
+    },
+    [loadAccounts, loadFolders, loadEnvelopes, toast],
+  );
+
+  const handleToggleAccount = useCallback(
+    async (id: string, enabled: boolean) => {
+      await api.accounts.toggle(id, enabled);
+      await loadAccounts();
+    },
+    [loadAccounts],
+  );
+
+  const handleTestAccount = useCallback(
+    (input: AccountInput): Promise<ConnectionTestResult> => api.accounts.test(input),
+    [],
+  );
+
+  const handleTestSmtp = useCallback(
+    (input: AccountInput): Promise<ConnectionTestResult> => api.accounts.testSmtp(input),
+    [],
+  );
+
+  /* ------------------------------------------------------------------- copy */
 
   const handleCopy = useCallback(
     (text: string) => {
@@ -152,182 +438,124 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
     [toast],
   );
 
-  const handleSyncNow = useCallback(async () => {
-    setSyncing(true);
-    try {
-      const result = await api.sync.now();
-      await loadMessages();
-      setLastSyncAt(result.finishedAt);
-      await loadSources();
-      toast(result.totalAdded > 0 ? `同步完成，新增 ${result.totalAdded} 条验证码` : '同步完成，暂无新验证码', 'info');
-    } catch (error) {
-      toast(error instanceof Error ? error.message : String(error), 'error');
-    } finally {
-      setSyncing(false);
+  /* ---------------------------------------------------------------- derived */
+
+  const accountsById = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const account of accounts) map[account.id] = account.name;
+    return map;
+  }, [accounts]);
+
+  const foldersById = useMemo(() => {
+    const map: Record<string, string> = {};
+    // Envelope.folderId holds the folder *path* (e.g. "INBOX"), so key by path.
+    for (const folders of Object.values(foldersByAccount)) {
+      for (const folder of folders) map[folder.path] = folder.name;
     }
-  }, [loadMessages, loadSources, toast]);
+    return map;
+  }, [foldersByAccount]);
 
-  const handleToggleRead = useCallback((id: string, read: boolean) => {
-    setMessages((prev) => prev.map((message) => (message.id === id ? { ...message, read } : message)));
-    void api.messages.markRead(id, read);
-  }, []);
+  const messageFolders = useMemo(
+    () => (selectedMessage ? foldersByAccount[selectedMessage.envelope.accountId] ?? [] : []),
+    [selectedMessage, foldersByAccount],
+  );
 
-  const handleDeleteMessage = useCallback((id: string) => {
-    setMessages((prev) => prev.filter((message) => message.id !== id));
-    void api.messages.remove(id);
-  }, []);
+  const unreadCount = useMemo(
+    () =>
+      Object.values(foldersByAccount)
+        .flat()
+        .reduce((sum, folder) => sum + folder.unreadCount, 0),
+    [foldersByAccount],
+  );
 
-  const handleClearMessages = useCallback(async () => {
-    await api.messages.clear();
-    setMessages([]);
-    toast('已清空验证码记录', 'success');
-  }, [toast]);
+  const showMigrationBanner = settings.migrationNotice.trim().length > 0;
 
-  const handleMarkAllRead = useCallback(async () => {
-    await api.messages.markAllRead();
-    setMessages((prev) => prev.map((message) => ({ ...message, read: true })));
-  }, []);
+  /* ----------------------------------------------------------------- render */
 
-  const handleCreateSource = useCallback(
-    async (input: SourceInput) => {
-      await api.sources.create(input);
-      await loadSources();
-      toast('来源已添加', 'success');
+  const changeView = useCallback(
+    (next: ViewKey) => {
+      setView(next);
+      if (next !== 'mail') setAccountsOpen(false);
+      if (next === 'authenticator') void refreshTotpCount();
     },
-    [loadSources, toast],
+    [refreshTotpCount],
   );
 
-  const handleUpdateSource = useCallback(
-    async (id: string, input: SourceInput) => {
-      await api.sources.update(id, input);
-      await loadSources();
-      toast('来源已更新', 'success');
-    },
-    [loadSources, toast],
-  );
-
-  const handleDeleteSource = useCallback(
-    async (id: string) => {
-      await api.sources.remove(id);
-      await Promise.all([loadSources(), loadMessages()]);
-      toast('来源已删除', 'success');
-    },
-    [loadMessages, loadSources, toast],
-  );
-
-  const handleToggleSource = useCallback(
-    async (id: string, enabled: boolean) => {
-      await api.sources.toggle(id, enabled);
-      await loadSources();
-    },
-    [loadSources],
-  );
-
-  const handleTestSource = useCallback(
-    (input: SourceInput): Promise<ConnectionTestResult> => api.sources.test(input),
-    [],
-  );
-
-  const refreshEverything = useCallback(async () => {
-    await Promise.all([reloadSettings(), reloadAll()]);
-  }, [reloadAll, reloadSettings]);
-
-  const totpCount = sources.filter((source) => source.kind === 'totp').length;
-  const unreadCount = messages.filter((message) => !message.read).length;
-
-  const content = useMemo(() => {
-    switch (view) {
-      case 'sources':
-        return (
-          <Sources
-            sources={sources}
-            presets={presets}
-            onCreate={handleCreateSource}
-            onUpdate={handleUpdateSource}
-            onDelete={handleDeleteSource}
-            onToggle={handleToggleSource}
-            onTest={handleTestSource}
-          />
-        );
-      case 'authenticator':
-        return (
-          <Authenticator
-            onCopy={handleCopy}
-            onChanged={() => void loadSources()}
-            onGoSources={() => setView('sources')}
-          />
-        );
-      case 'settings':
-        return (
-          <Settings
-            settings={settings}
-            appVersion={api.system.appVersion}
-            platform={api.system.platform}
-            onUpdate={onUpdateSettings}
-            onRefresh={() => void refreshEverything()}
-          />
-        );
-      default:
-        return (
-          <Inbox
-            messages={messages}
-            sources={sources}
-            highlightIds={highlightIds}
-            loading={loading}
-            pinRecent={settings.pinRecent}
-            onToggleRead={handleToggleRead}
-            onDelete={handleDeleteMessage}
-            onClear={() => void handleClearMessages()}
-            onMarkAllRead={() => void handleMarkAllRead()}
-            onCopy={handleCopy}
-          />
-        );
-    }
-  }, [
-    view,
-    sources,
-    presets,
-    messages,
-    highlightIds,
-    loading,
-    settings,
-    handleCreateSource,
-    handleUpdateSource,
-    handleDeleteSource,
-    handleToggleSource,
-    handleTestSource,
-    handleCopy,
-    handleDeleteMessage,
-    handleClearMessages,
-    handleMarkAllRead,
-    handleToggleRead,
-    loadSources,
-    onUpdateSettings,
-    refreshEverything,
-  ]);
+  const mailContent =
+    view === 'mail' ? (
+      accountsOpen ? (
+        <Accounts
+          accounts={accounts}
+          presets={presets}
+          onCreate={handleCreateAccount}
+          onUpdate={handleUpdateAccount}
+          onDelete={handleDeleteAccount}
+          onToggle={handleToggleAccount}
+          onTest={handleTestAccount}
+          onTestSmtp={handleTestSmtp}
+        />
+      ) : (
+        <Mail
+          accounts={accounts}
+          foldersByAccount={foldersByAccount}
+          envelopes={envelopes}
+          accountsById={accountsById}
+          foldersById={foldersById}
+          selection={selection}
+          selectedMessage={selectedMessage}
+          messageFolders={messageFolders}
+          loading={loading}
+          syncing={syncing}
+          highlightIds={highlightIds}
+          filter={filter}
+          bodyRenderMode={settings.bodyRenderMode}
+          allowRemoteImages={settings.allowRemoteImages}
+          downloadingPartId={downloadingPartId}
+          composeOpen={composeOpen}
+          composeInitial={composeInitial}
+          onSelectAll={handleSelectAll}
+          onSelectAccount={handleSelectAccount}
+          onSelectFolder={handleSelectFolder}
+          onManageAccounts={() => setAccountsOpen(true)}
+          onFilterChange={(patch) => setFilter((prev) => ({ ...prev, ...patch }))}
+          onSelectEnvelope={handleSelectEnvelope}
+          onCopy={handleCopy}
+          onMarkAllRead={handleMarkAllRead}
+          onReply={handleReply}
+          onForward={handleForward}
+          onDeleteSelected={() => setPendingDelete(selectedMessage?.envelope ?? null)}
+          onToggleSeen={handleToggleSeen}
+          onMove={handleMove}
+          onDownloadAttachment={handleDownloadAttachment}
+          onToggleExternalImages={(allow) => void onUpdateSettings({ allowRemoteImages: allow })}
+          onComposeClose={() => setComposeOpen(false)}
+          onComposeSent={handleComposeSent}
+        />
+      )
+    ) : null;
 
   return (
     <Box sx={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
-      <Sidebar
-        view={view}
-        unreadCount={unreadCount}
-        sourceCount={sources.length}
-        totpCount={totpCount}
-        onChange={setView}
-      />
+      <Sidebar view={view} unreadCount={unreadCount} totpCount={totpCount} onChange={changeView} />
+
       <Box sx={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
         <Box
           sx={{
             display: 'flex',
             alignItems: 'center',
             gap: 1,
-            px: 3,
-            py: 1.5,
+            px: 2.5,
+            py: 1.25,
             borderBottom: 1,
             borderColor: 'divider',
             bgcolor: 'background.paper',
           }}
         >
+          {accountsOpen ? (
+            <Button size="small" onClick={() => setAccountsOpen(false)}>
+              返回邮件
+            </Button>
+          ) : null}
           <Typography variant="subtitle1">{VIEW_TITLES[view]}</Typography>
           {syncing ? (
             <Chip size="small" color="primary" label="同步中…" variant="outlined" />
@@ -340,40 +568,67 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
               尚未同步
             </Typography>
           )}
+
           <Box sx={{ ml: 'auto', display: 'flex', alignItems: 'center', gap: 1 }}>
-            <Button
-              size="small"
-              variant="outlined"
-              startIcon={<RefreshIcon />}
-              onClick={() => void reloadAll()}
-            >
+            <Button size="small" variant="outlined" startIcon={<RefreshIcon />} onClick={() => void handleRefresh()}>
               刷新
             </Button>
-            <Button
-              size="small"
-              variant="contained"
-              disabled={syncing}
-              startIcon={
-                syncing ? (
-                  <CircularProgress size={16} color="inherit" />
-                ) : (
-                  <SyncIcon
-                    sx={{
-                      animation: syncing ? 'hub-spin 1s linear infinite' : 'none',
-                      '@keyframes hub-spin': {
-                        from: { transform: 'rotate(0deg)' },
-                        to: { transform: 'rotate(360deg)' },
-                      },
-                    }}
-                  />
-                )
-              }
-              onClick={() => void handleSyncNow()}
-            >
-              立即同步
-            </Button>
+            {view === 'mail' && !accountsOpen ? (
+              <>
+                <Button
+                  size="small"
+                  variant="outlined"
+                  startIcon={<EditNoteOutlinedIcon />}
+                  onClick={() => openCompose(null)}
+                >
+                  写邮件
+                </Button>
+                <Button
+                  size="small"
+                  variant="contained"
+                  disabled={syncing}
+                  startIcon={
+                    syncing ? (
+                      <CircularProgress size={16} color="inherit" />
+                    ) : (
+                      <SyncIcon
+                        sx={{
+                          animation: syncing ? 'hub-spin 1s linear infinite' : 'none',
+                          '@keyframes hub-spin': {
+                            from: { transform: 'rotate(0deg)' },
+                            to: { transform: 'rotate(360deg)' },
+                          },
+                        }}
+                      />
+                    )
+                  }
+                  onClick={() => void handleSyncNow()}
+                >
+                  立即同步
+                </Button>
+              </>
+            ) : null}
           </Box>
         </Box>
+
+        {showMigrationBanner ? (
+          <Alert
+            severity="info"
+            sx={{ borderRadius: 0 }}
+            action={
+              <Button
+                color="inherit"
+                size="small"
+                startIcon={<CloseIcon fontSize="small" />}
+                onClick={() => void onUpdateSettings({ migrationNotice: '' })}
+              >
+                知道了
+              </Button>
+            }
+          >
+            {settings.migrationNotice}
+          </Alert>
+        ) : null}
 
         {bootError ? (
           <Alert severity="error" sx={{ mx: 3, mt: 2 }}>
@@ -381,8 +636,32 @@ function AppShell({ settings, onUpdateSettings, reloadSettings }: ShellProps): J
           </Alert>
         ) : null}
 
-        <Box sx={{ flex: 1, minHeight: 0 }}>{content}</Box>
+        <Box sx={{ flex: 1, minHeight: 0 }}>
+          {mailContent}
+          {view === 'authenticator' ? (
+            <Authenticator onCopy={handleCopy} onChanged={() => void refreshTotpCount()} />
+          ) : null}
+          {view === 'settings' ? (
+            <Settings
+              settings={settings}
+              appVersion={api.system.appVersion}
+              platform={api.system.platform}
+              onUpdate={onUpdateSettings}
+              onRefresh={() => void handleRefresh()}
+            />
+          ) : null}
+        </Box>
       </Box>
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        title="删除这封邮件？"
+        description={`确定要删除「${pendingDelete?.subject ?? ''}」吗？服务器上的邮件也会一并删除。`}
+        confirmLabel="删除"
+        danger
+        onCancel={() => setPendingDelete(null)}
+        onConfirm={confirmDelete}
+      />
     </Box>
   );
 }
@@ -424,11 +703,7 @@ export default function App(): JSX.Element {
     <ThemeProvider theme={theme}>
       <CssBaseline />
       <ToastProvider>
-        <AppShell
-          settings={settings}
-          onUpdateSettings={handleUpdateSettings}
-          reloadSettings={reloadSettings}
-        />
+        <AppShell settings={settings} onUpdateSettings={handleUpdateSettings} reloadSettings={reloadSettings} />
       </ToastProvider>
     </ThemeProvider>
   );

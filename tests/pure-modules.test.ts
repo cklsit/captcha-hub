@@ -28,6 +28,12 @@ const PURE_ENTRY_POINTS = [
   'electron/dedupe.ts',
   'electron/totp.ts',
   'electron/imap.ts',
+  'electron/mail-store-core.ts',
+  'electron/parse-mail.ts',
+  'electron/sanitize.ts',
+  'electron/migrate-core.ts',
+  'electron/ingest-core.ts',
+  'electron/settings.ts',
 ];
 
 const IMPORT_RE = /(?:from\s*|require\(\s*)['"]([^'"]+)['"]/g;

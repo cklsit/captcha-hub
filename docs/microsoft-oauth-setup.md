@@ -27,7 +27,7 @@ S> a2 NO Basic authentication is disabled.
 
 | 字段 | 填什么 |
 | --- | --- |
-| 名称 | 随意，例如 `Captcha Hub` |
+| 名称 | 随意，例如 `Mail Hub` |
 | 支持的帐户类型 | ⚠️ 选**第三项**：「任何组织目录中的帐户…和个人 Microsoft 帐户」 |
 | 重定向 URI | **留空**（设备码流程不需要） |
 
@@ -48,15 +48,19 @@ S> a2 NO Basic authentication is disabled.
 
 > 不开这一步，获取设备码会报 `invalid_client` / `AADSTS7000218`。
 
-### 5. 添加 IMAP 权限
+### 5. 添加 IMAP / SMTP 权限
 
 左侧 **API 权限** → **添加权限**：
 
 1. 选 **我的组织使用的 API** 标签页
 2. 搜索 `Office 365 Exchange Online` 并点进去
-   （若这里找不到，改走 **Microsoft Graph** → 委托的权限 → 搜 `IMAP`）
-3. 选 **委托的权限**，勾选 **IMAP.AccessAsUser.All**
+   （若这里找不到，改走 **Microsoft Graph** → 委托的权限 → 搜 `IMAP` / `SMTP`）
+3. 选 **委托的权限**，勾选 **IMAP.AccessAsUser.All**（收信）与 **SMTP.Send**（发信）
 4. **添加权限**
+
+> **只收信**可以只勾 `IMAP.AccessAsUser.All`；但本应用不只是收验证码，还要能**发信**，
+> 因此推荐一并勾上 **SMTP.Send**。若你此前只授权了 IMAP，**首次发信**时应用会提示
+> 「需重新授权以启用发信」，此时回到本应用重新点一次「使用 Microsoft 账户登录」即可补齐 scope。
 
 个人账户到此即可——登录时会在授权页现场征求你的同意。
 
@@ -65,9 +69,9 @@ S> a2 NO Basic authentication is disabled.
 
 ---
 
-## 在应用里添加来源
+## 在应用里添加账户
 
-1. 来源管理 → **新增来源** → 类型选「邮箱来源」
+1. 邮件页 → 右上角齿轮 / **管理账户** → **新增账户**
 2. **认证方式** 选 **「Microsoft 账户登录（Outlook / Hotmail / M365）」**
 3. 服务器填 `outlook.office365.com`，端口 `993`，开启 SSL/TLS
    （点「Outlook / Hotmail」快捷预设会自动填好）
@@ -85,8 +89,9 @@ S> a2 NO Basic authentication is disabled.
 - 访问令牌与刷新令牌**只存在于主进程**，不经过渲染层，也不会显示在任何界面上
 - 两者落盘前都加密（`safeStorage` 优先，降级 AES-256-GCM）
 - 访问令牌过期前会自动静默刷新，你无需重复登录
+- 应用会记录服务器**实际授予的 scope**；缺少 `SMTP.Send` 时首次发信会提示重新登录
 - 导出备份时**不会**包含令牌；恢复备份后需要重新授权一次
-- 把来源的认证方式改回「密码 / 授权码」会**清除**已保存的令牌
+- 把账户的认证方式改回「密码 / 授权码」会**清除**已保存的令牌
 
 ## 撤销授权
 
@@ -101,6 +106,7 @@ S> a2 NO Basic authentication is disabled.
 | `AADSTS700038` | Client ID 填错或不是有效的应用 ID |
 | `unauthorized_client` / 授权页报错 | 第 2 步账户类型选成了「仅此组织目录」 |
 | 登录成功但同步报 `AUTHENTICATE failed` | 第 5 步的 IMAP 权限没加，或工作账户缺管理员同意 |
+| 收信正常但**发信**提示「需重新授权」 | 第 5 步的 `SMTP.Send` 权限没加；补齐后重新登录一次 |
 | `服务端未启用 IMAP` | 到 Outlook.com 网页版「设置 → 邮件 → 转发和 IMAP」打开 IMAP |
 
 参考：[微软官方文档 — 使用 OAuth 验证 IMAP/POP/SMTP 连接](https://learn.microsoft.com/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth)

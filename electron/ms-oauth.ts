@@ -25,11 +25,33 @@ import type { MsLoginPollResult, MsLoginStartResult, MsLoginStatus } from '../sh
 /** IMAP scope for the Outlook resource — valid for both personal and work accounts. */
 export const MS_IMAP_SCOPE = 'https://outlook.office.com/IMAP.AccessAsUser.All';
 
+/**
+ * SMTP scope, needed to *send* through Outlook. Added in v2; accounts that were
+ * authorised before this existed must re-consent once before they can send
+ * (the receive path keeps working with the old token in the meantime).
+ */
+export const MS_SMTP_SCOPE = 'https://outlook.office.com/SMTP.Send';
+
 /** `common` serves personal (outlook.com/hotmail) and work/school tenants alike. */
 export const MS_DEFAULT_TENANT = 'common';
 
 /** `offline_access` is what makes Microsoft hand back a refresh token. */
-export const MS_SCOPES = ['offline_access', MS_IMAP_SCOPE];
+export const MS_SCOPES = ['offline_access', MS_IMAP_SCOPE, MS_SMTP_SCOPE];
+
+/** Normalises a space-delimited `scope` value into a trimmed list. */
+export function parseScopes(value: unknown): string[] {
+  if (typeof value !== 'string') return [];
+  return value
+    .split(/\s+/)
+    .map((scope) => scope.trim())
+    .filter((scope) => scope.length > 0);
+}
+
+/** True when `scopes` contains `wanted` (case-insensitive). */
+export function hasScope(scopes: string[], wanted: string): boolean {
+  const target = wanted.toLowerCase();
+  return scopes.some((scope) => scope.toLowerCase() === target);
+}
 
 /** Refresh a little before the token actually dies, to avoid mid-fetch expiry. */
 const EXPIRY_SKEW_MS = 120_000;
@@ -42,6 +64,8 @@ export interface TokenSet {
   refreshToken: string;
   /** Epoch ms at which `accessToken` stops being usable. */
   expiresAt: number;
+  /** Scope set Microsoft reports as actually granted. */
+  scopes: string[];
 }
 
 /* ------------------------------------------------------------ pure helpers */
@@ -104,10 +128,15 @@ export function parseTokenResponse(payload: unknown, now: number = Date.now()): 
   const accessToken = asString(raw.access_token);
   if (!accessToken) return null;
 
+  // Microsoft normally echoes the granted scope set; when it omits it we assume
+  // the request was fulfilled rather than locking the user into a reauth loop.
+  const granted = parseScopes(raw.scope);
+
   return {
     accessToken,
     refreshToken: asString(raw.refresh_token),
     expiresAt: now + asPositiveInt(raw.expires_in, 3600) * 1000,
+    scopes: granted.length > 0 ? granted : [...MS_SCOPES],
   };
 }
 

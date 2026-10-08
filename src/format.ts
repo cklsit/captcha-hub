@@ -37,3 +37,33 @@ export function formatCountdown(seconds: number): string {
   const rest = safe % 60;
   return `${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
 }
+
+/** Absolute date+time for mail headers. */
+export function formatFullDate(timestamp: number): string {
+  return new Date(timestamp).toLocaleString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+/** Compact timestamp for list rows (today → time, else → date). */
+export function formatListTime(timestamp: number, now: number = Date.now()): string {
+  const date = new Date(timestamp);
+  const sameDay = new Date(now).toDateString() === date.toDateString();
+  if (sameDay) {
+    return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  }
+  return date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+}
+
+/** Human-readable byte size. */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const exponent = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  const value = bytes / 1024 ** exponent;
+  return `${value.toFixed(exponent === 0 ? 0 : 1)} ${units[exponent]}`;
+}

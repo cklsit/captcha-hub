@@ -1,4 +1,4 @@
-import type { ExtractedCode, Source } from '../shared/types';
+import type { ExtractedCode } from '../shared/types';
 
 /**
  * Verification-code extraction engine.
@@ -49,7 +49,11 @@ interface KeywordHit {
 }
 
 /**
- * Minimum confidence a candidate must reach before it may enter the inbox.
+ * Minimum confidence a candidate must reach to be treated as a real code.
+ *
+ * In v2 this is NO LONGER an ingestion gate — every mail is stored regardless.
+ * It only decides whether the code is *highlighted* on the mail card / body and
+ * whether the one-click “copy” affordance is shown.
  *
  * Keyword-anchored codes score around 0.82 while accidental digit runs pulled
  * out of dates, ids, amounts or addresses land at 0.2 or below, so this
@@ -57,24 +61,6 @@ interface KeywordHit {
  * merely happen to lack an expiry hint.
  */
 export const MIN_CONFIDENCE = 0.45;
-
-/**
- * Decides whether a fetched mail may enter the inbox.
- *
- * Baseline (`receivedAt >= baseline`): only codes arriving *after* the source
- * was added are imported. A mailbox's back catalogue is none of our business —
- * importing it floods the inbox with stale codes and, worse, with old mails
- * that merely happen to contain a number.
- *
- * Threshold: extractions scoring below `MIN_CONFIDENCE` are speculative digit
- * runs (dates, order ids, amounts, address fragments) rather than codes.
- *
- * Lives here rather than in `ingest.ts` on purpose: this file has no Electron
- * or Node dependency, so it stays unit-testable in a headless CI runner.
- */
-export function isIngestible(receivedAt: number, baseline: number, confidence: number): boolean {
-  return receivedAt >= baseline && confidence >= MIN_CONFIDENCE;
-}
 
 interface Candidate {
   value: string;
@@ -287,46 +273,4 @@ export function extractCode(input: ExtractInput, now: number = Date.now()): Extr
     matchedKeyword: best.keyword,
     expiresAtHint,
   };
-}
-
-export interface MailForAssign {
-  subject: string;
-  from: string;
-  text: string;
-}
-
-/**
- * Resolves which source a mail belongs to.
- * Phone sources win when their forwarding rule matches the mail; otherwise the
- * mail stays attributed to the email source it was fetched from.
- */
-export function resolveSourceForMail(
-  mail: MailForAssign,
-  emailSourceId: string,
-  allSources: Source[],
-): { source: Source; matchedByRule: boolean } | null {
-  const phoneSources = allSources.filter(
-    (source) =>
-      source.kind === 'phone' &&
-      source.phone !== null &&
-      source.phone.rule.emailSourceId === emailSourceId,
-  );
-
-  for (const phoneSource of phoneSources) {
-    const rule = phoneSource.phone?.rule;
-    if (!rule || !rule.matchKeyword) continue;
-    const field =
-      rule.matchField === 'subject'
-        ? mail.subject
-        : rule.matchField === 'from'
-          ? mail.from
-          : mail.text;
-    if (field.toLowerCase().includes(rule.matchKeyword.toLowerCase())) {
-      return { source: phoneSource, matchedByRule: true };
-    }
-  }
-
-  const emailSource = allSources.find((source) => source.id === emailSourceId);
-  if (emailSource) return { source: emailSource, matchedByRule: false };
-  return null;
 }

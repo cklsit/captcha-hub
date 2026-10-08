@@ -1,46 +1,40 @@
 import Store from 'electron-store';
 import { randomUUID } from 'node:crypto';
 import { decryptString, encryptString } from './crypto';
-import { capMessages, mergeMessages, sortByReceivedDesc } from './dedupe';
 import { getPendingTokens, MS_DEFAULT_TENANT } from './ms-oauth';
+import { DEFAULT_SETTINGS, mergeSettings } from './settings';
 import { withTotpDefaults } from './totp';
 import type {
+  Account,
+  AccountInput,
   AppSettings,
   BackupBundle,
-  CaptchaMessage,
   EmailAuthType,
-  MessageFilter,
-  SafeEmailCredentials,
-  SafeSource,
+  SafeAccount,
+  SafeImapCredentials,
+  SafeSmtpCredentials,
+  SafeTotpEntry,
   SafeTotpSecret,
-  Source,
-  SourceInput,
+  SmtpCredentials,
   SyncStatus,
+  TotpEntry,
+  TotpEntryInput,
   TotpExportItem,
 } from '../shared/types';
 
 /**
- * Persistence layer.
+ * Configuration persistence (accounts / TOTP entries / settings).
  *
- * Storage engine: `electron-store` (pure-JS, JSON file). We deliberately avoid
- * `better-sqlite3` because its native addon frequently fails to build on plain
- * Windows dev machines without a full toolchain; electron-store keeps the whole
- * app runnable with zero native compilation while still being simple and
- * atomic. Secrets are encrypted before they ever hit the disk (see crypto.ts).
+ * Storage engine: `electron-store` (pure-JS, JSON file, atomic). We deliberately
+ * avoid any native module — a second ABI in `node_modules` would make `npm test`
+ * (Node ABI) and `npm run dev` (Electron ABI) mutually exclusive. Secrets are
+ * encrypted before they ever hit the disk (see crypto.ts). Mail envelopes and
+ * bodies live in `mail-store-core.ts`, not here.
  */
 
-const MAX_MESSAGES = 2000;
-
-export const DEFAULT_SETTINGS: AppSettings = {
-  theme: 'dark',
-  pollIntervalSec: 60,
-  launchOnStartup: false,
-  pinRecent: true,
-};
-
 type PersistShape = {
-  sources: Source[];
-  messages: CaptchaMessage[];
+  accounts: Account[];
+  totpEntries: TotpEntry[];
   settings: AppSettings;
 };
 
@@ -49,10 +43,10 @@ let storeInstance: Store<PersistShape> | null = null;
 function store(): Store<PersistShape> {
   if (!storeInstance) {
     storeInstance = new Store<PersistShape>({
-      name: 'captcha-hub-data',
+      name: 'mail-hub-data',
       defaults: {
-        sources: [],
-        messages: [],
+        accounts: [],
+        totpEntries: [],
         settings: DEFAULT_SETTINGS,
       },
     });
@@ -73,450 +67,376 @@ function safeDecrypt(value: string): string {
  * passwords here: a refresh token is a durable, revocable key to the mailbox,
  * so it must never sit in the JSON file in the clear.
  */
-function encryptSource(source: Source): Source {
-  const next = clone(source);
-  if (next.email) {
-    if (next.email.password) next.email.password = encryptString(next.email.password);
-    if (next.email.refreshToken) next.email.refreshToken = encryptString(next.email.refreshToken);
-    if (next.email.accessToken) next.email.accessToken = encryptString(next.email.accessToken);
-  }
-  if (next.totp && next.totp.secret) {
-    next.totp.secret = encryptString(next.totp.secret);
-  }
+function encryptAccount(account: Account): Account {
+  const next = clone(account);
+  if (next.imap.password) next.imap.password = encryptString(next.imap.password);
+  if (next.imap.refreshToken) next.imap.refreshToken = encryptString(next.imap.refreshToken);
+  if (next.imap.accessToken) next.imap.accessToken = encryptString(next.imap.accessToken);
+  if (next.smtp && next.smtp.password) next.smtp.password = encryptString(next.smtp.password);
   return next;
 }
 
-function decryptSource(source: Source): Source {
-  const next = clone(source);
-  if (next.email) {
-    if (next.email.password) next.email.password = safeDecrypt(next.email.password);
-    if (next.email.refreshToken) next.email.refreshToken = safeDecrypt(next.email.refreshToken);
-    if (next.email.accessToken) next.email.accessToken = safeDecrypt(next.email.accessToken);
-  }
-  if (next.totp && next.totp.secret) {
-    next.totp.secret = safeDecrypt(next.totp.secret);
-  }
+function decryptAccount(account: Account): Account {
+  const next = clone(account);
+  if (next.imap.password) next.imap.password = safeDecrypt(next.imap.password);
+  if (next.imap.refreshToken) next.imap.refreshToken = safeDecrypt(next.imap.refreshToken);
+  if (next.imap.accessToken) next.imap.accessToken = safeDecrypt(next.imap.accessToken);
+  if (next.smtp && next.smtp.password) next.smtp.password = safeDecrypt(next.smtp.password);
   return next;
 }
 
-function toSafeSource(source: Source): SafeSource {
-  let email: SafeEmailCredentials | null = null;
-  if (source.email) {
-    const { password, refreshToken, accessToken, ...rest } = source.email;
-    email = {
-      ...rest,
-      hasPassword: Boolean(password),
-      hasRefreshToken: Boolean(refreshToken),
-    };
-  }
-  let totp: SafeTotpSecret | null = null;
-  if (source.totp) {
-    const { secret, ...rest } = source.totp;
-    totp = { ...rest, hasSecret: Boolean(secret) };
+function encryptTotpEntry(entry: TotpEntry): TotpEntry {
+  const next = clone(entry);
+  if (next.totp.secret) next.totp.secret = encryptString(next.totp.secret);
+  return next;
+}
+
+function decryptTotpEntry(entry: TotpEntry): TotpEntry {
+  const next = clone(entry);
+  if (next.totp.secret) next.totp.secret = safeDecrypt(next.totp.secret);
+  return next;
+}
+
+function toSafeAccount(account: Account): SafeAccount {
+  const { password, refreshToken, accessToken, ...imapRest } = account.imap;
+  const imap: SafeImapCredentials = {
+    ...imapRest,
+    hasPassword: Boolean(password),
+    hasRefreshToken: Boolean(refreshToken),
+  };
+  let smtp: SafeSmtpCredentials | null = null;
+  if (account.smtp) {
+    const { password: smtpPassword, ...smtpRest } = account.smtp;
+    smtp = { ...smtpRest, hasPassword: Boolean(smtpPassword) };
   }
   return {
-    id: source.id,
-    kind: source.kind,
-    name: source.name,
-    enabled: source.enabled,
-    createdAt: source.createdAt,
-    updatedAt: source.updatedAt,
-    lastSyncAt: source.lastSyncAt,
-    lastSyncStatus: source.lastSyncStatus,
-    lastSyncError: source.lastSyncError,
-    email,
-    phone: source.phone,
-    totp,
+    id: account.id,
+    name: account.name,
+    enabled: account.enabled,
+    emailAddress: account.emailAddress,
+    displayName: account.displayName,
+    imap,
+    smtp,
+    syncFolders: account.syncFolders,
+    signature: account.signature,
+    scopes: account.scopes,
+    needsReauth: account.needsReauth,
+    createdAt: account.createdAt,
+    updatedAt: account.updatedAt,
+    lastSyncAt: account.lastSyncAt,
+    lastSyncStatus: account.lastSyncStatus,
+    lastSyncError: account.lastSyncError,
   };
 }
 
-/* ------------------------------------------------------------------ sources */
-
-/** All sources with secrets decrypted — MAIN PROCESS ONLY. */
-export function getSources(): Source[] {
-  return store().get('sources').map(decryptSource);
+function toSafeTotpEntry(entry: TotpEntry): SafeTotpEntry {
+  const { secret, ...rest } = entry.totp;
+  const safe: SafeTotpSecret = { ...rest, hasSecret: Boolean(secret) };
+  return { ...entry, totp: safe };
 }
 
-/** All sources with secrets stripped — safe to send to the renderer. */
-export function listSafeSources(): SafeSource[] {
-  return getSources().map(toSafeSource);
+/* --------------------------------------------------------------- accounts */
+
+/** All accounts with secrets decrypted — MAIN PROCESS ONLY. */
+export function getAccounts(): Account[] {
+  return store().get('accounts').map(decryptAccount);
 }
 
-/** A single decrypted source (for IMAP / TOTP work) — MAIN PROCESS ONLY. */
-export function getSource(id: string): Source | null {
-  const found = getSources().find((source) => source.id === id);
-  return found ?? null;
+export function listSafeAccounts(): SafeAccount[] {
+  return getAccounts().map(toSafeAccount);
 }
 
-function buildSource(input: SourceInput, existing?: Source): Source {
+export function getAccount(id: string): Account | null {
+  return getAccounts().find((account) => account.id === id) ?? null;
+}
+
+function buildAccount(input: AccountInput, existing?: Account): Account {
   const now = Date.now();
-  const base: Source = existing
+  const authType: EmailAuthType = input.imap?.authType ?? existing?.imap.authType ?? 'password';
+  const keepTokens = authType === 'oauth2';
+
+  const base: Account = existing
     ? clone(existing)
     : {
         id: input.id ?? randomUUID(),
-        kind: input.kind,
         name: input.name,
         enabled: input.enabled,
+        emailAddress: '',
+        displayName: '',
+        imap: {
+          host: '',
+          port: 993,
+          secure: true,
+          username: '',
+          password: '',
+          authType,
+          clientId: '',
+          tenant: MS_DEFAULT_TENANT,
+          refreshToken: '',
+          accessToken: '',
+          accessTokenExpiresAt: 0,
+        },
+        smtp: null,
+        syncFolders: ['INBOX'],
+        signature: '',
+        scopes: [],
+        needsReauth: false,
         createdAt: now,
         updatedAt: now,
         lastSyncAt: null,
         lastSyncStatus: 'never',
         lastSyncError: null,
-        email: null,
-        phone: null,
-        totp: null,
       };
 
-  base.kind = input.kind;
-  base.name = input.name.trim() || base.name || '未命名来源';
+  base.name = input.name.trim() || base.name || '未命名账户';
   base.enabled = input.enabled;
   base.updatedAt = now;
 
-  if (input.kind === 'email') {
-    const previous = existing?.email;
-    const authType: EmailAuthType = input.email?.authType ?? previous?.authType ?? 'password';
-    const keepTokens = authType === 'oauth2';
+  // Freshly minted tokens (from a just-finished device-code login) replace
+  // whatever is stored; otherwise existing tokens are kept so merely editing an
+  // account never silently signs the user out.
+  const flow = input.imap?.oauthFlowId ? getPendingTokens(input.imap.oauthFlowId) : null;
+  if (keepTokens && !flow && !existing?.imap.refreshToken) {
+    throw new Error('请先完成 Microsoft 账户登录，再保存该账户。');
+  }
 
-    // Freshly minted tokens (from a just-finished device-code login) replace
-    // whatever is stored; otherwise the existing ones are kept so that merely
-    // editing a source never silently signs the user out.
-    const flow = input.email?.oauthFlowId ? getPendingTokens(input.email.oauthFlowId) : null;
-    if (keepTokens && !flow && !previous?.refreshToken) {
-      throw new Error('请先完成 Microsoft 账户登录，再保存该来源。');
+  base.imap = {
+    host: input.imap?.host ?? existing?.imap.host ?? '',
+    port: input.imap?.port ?? existing?.imap.port ?? 993,
+    secure: input.imap?.secure ?? existing?.imap.secure ?? true,
+    username: input.imap?.username ?? existing?.imap.username ?? '',
+    password: input.imap?.password ? input.imap.password : (existing?.imap.password ?? ''),
+    authType,
+    clientId: input.imap?.clientId?.trim() ?? existing?.imap.clientId ?? '',
+    tenant: input.imap?.tenant?.trim() || existing?.imap.tenant || MS_DEFAULT_TENANT,
+    // Switching an account back to password auth drops the tokens: keeping a
+    // live mailbox key around that the user has just stopped using is a
+    // liability, not a convenience.
+    refreshToken: keepTokens ? flow?.refreshToken || existing?.imap.refreshToken || '' : '',
+    accessToken: keepTokens ? flow?.accessToken || existing?.imap.accessToken || '' : '',
+    accessTokenExpiresAt: keepTokens
+      ? (flow?.expiresAt ?? existing?.imap.accessTokenExpiresAt ?? 0)
+      : 0,
+  };
+
+  base.emailAddress = input.emailAddress?.trim() || base.imap.username;
+  base.displayName = input.displayName ?? existing?.displayName ?? '';
+  base.signature = input.signature ?? existing?.signature ?? '';
+  base.syncFolders =
+    input.syncFolders && input.syncFolders.length > 0
+      ? [...new Set(input.syncFolders)]
+      : (existing?.syncFolders ?? ['INBOX']);
+
+  if (flow) {
+    base.scopes = flow.scopes;
+    base.needsReauth = false;
+  } else if (existing) {
+    base.scopes = existing.scopes;
+    base.needsReauth = existing.needsReauth;
+  }
+
+  // SMTP: explicit input wins; otherwise keep what existed. An OAuth account
+  // reuses its XOAUTH2 token, so it needs no SMTP password.
+  if (input.smtp !== undefined) {
+    if (input.smtp === null) {
+      base.smtp = null;
+    } else {
+      const previous = existing?.smtp ?? null;
+      const smtpAuth: EmailAuthType =
+        input.smtp.authType ?? previous?.authType ?? (authType === 'oauth2' ? 'oauth2' : 'password');
+      const smtp: SmtpCredentials = {
+        host: input.smtp.host ?? previous?.host ?? base.imap.host,
+        port: input.smtp.port ?? previous?.port ?? 465,
+        secure: input.smtp.secure ?? previous?.secure ?? true,
+        username: input.smtp.username ?? previous?.username ?? base.imap.username,
+        password: input.smtp.password ? input.smtp.password : (previous?.password ?? ''),
+        authType: smtpAuth,
+      };
+      base.smtp = smtp;
     }
-
-    base.email = {
-      host: input.email?.host ?? previous?.host ?? '',
-      port: input.email?.port ?? previous?.port ?? 993,
-      secure: input.email?.secure ?? previous?.secure ?? true,
-      username: input.email?.username ?? previous?.username ?? '',
-      password: input.email?.password ? input.email.password : (previous?.password ?? ''),
-      mailbox: input.email?.mailbox || previous?.mailbox || 'INBOX',
-      authType,
-      clientId: input.email?.clientId?.trim() ?? previous?.clientId ?? '',
-      tenant: input.email?.tenant?.trim() || previous?.tenant || MS_DEFAULT_TENANT,
-      // Switching a source back to password auth drops the tokens: keeping a
-      // live mailbox key around that the user has just stopped using is a
-      // liability, not a convenience.
-      refreshToken: keepTokens ? flow?.refreshToken || previous?.refreshToken || '' : '',
-      accessToken: keepTokens ? flow?.accessToken || '' : '',
-      accessTokenExpiresAt: keepTokens ? (flow?.expiresAt ?? 0) : 0,
-    };
-    base.phone = null;
-    base.totp = null;
-  } else if (input.kind === 'phone') {
-    base.phone = {
-      phoneNumber: input.phone?.phoneNumber ?? existing?.phone?.phoneNumber ?? '',
-      rule: {
-        emailSourceId: input.phone?.rule.emailSourceId ?? existing?.phone?.rule.emailSourceId ?? '',
-        matchField: input.phone?.rule.matchField ?? existing?.phone?.rule.matchField ?? 'subject',
-        matchKeyword: input.phone?.rule.matchKeyword ?? existing?.phone?.rule.matchKeyword ?? '',
-      },
-    };
-    base.email = null;
-    base.totp = null;
-  } else {
-    const previousSecret = existing?.totp?.secret ?? '';
-    const merged = withTotpDefaults({
-      ...(existing?.totp ?? {}),
-      ...(input.totp ?? {}),
-    });
-    merged.secret = input.totp?.secret ? input.totp.secret : previousSecret;
-    base.totp = merged;
-    base.email = null;
-    base.phone = null;
   }
 
   return base;
 }
 
-export function createSource(input: SourceInput): SafeSource {
-  const sources = getSources();
-  const created = buildSource(input);
-  sources.push(encryptSource(created));
-  store().set('sources', sources);
-  return toSafeSource(created);
+export function createAccount(input: AccountInput): SafeAccount {
+  const accounts = getAccounts();
+  const created = buildAccount(input);
+  accounts.push(encryptAccount(created));
+  store().set('accounts', accounts);
+  return toSafeAccount(created);
 }
 
-export function updateSource(id: string, input: SourceInput): SafeSource {
-  const sources = getSources();
-  const index = sources.findIndex((source) => source.id === id);
-  if (index === -1) throw new Error(`来源不存在: ${id}`);
-  const updated = buildSource({ ...input, id }, sources[index]);
-  sources[index] = encryptSource(updated);
-  store().set('sources', sources);
-  return toSafeSource(updated);
+export function updateAccount(id: string, input: AccountInput): SafeAccount {
+  const accounts = getAccounts();
+  const index = accounts.findIndex((account) => account.id === id);
+  if (index === -1) throw new Error(`账户不存在: ${id}`);
+  const updated = buildAccount({ ...input, id }, accounts[index]);
+  accounts[index] = encryptAccount(updated);
+  store().set('accounts', accounts);
+  return toSafeAccount(updated);
 }
 
-export function deleteSource(id: string): void {
-  const sources = getSources().filter((source) => source.id !== id);
-  store().set('sources', sources);
-  // Also drop messages that referenced the deleted source.
-  const messages = store().get('messages').filter((message) => message.sourceId !== id);
-  store().set('messages', messages);
+export function deleteAccount(id: string): void {
+  store().set(
+    'accounts',
+    getAccounts().filter((account) => account.id !== id),
+  );
 }
 
-export function setSourceEnabled(id: string, enabled: boolean): SafeSource {
-  const sources = getSources();
-  const index = sources.findIndex((source) => source.id === id);
-  if (index === -1) throw new Error(`来源不存在: ${id}`);
-  sources[index].enabled = enabled;
-  sources[index].updatedAt = Date.now();
-  const result = sources[index];
-  sources[index] = encryptSource(result);
-  store().set('sources', sources);
-  return toSafeSource(result);
+export function setAccountEnabled(id: string, enabled: boolean): SafeAccount {
+  const accounts = getAccounts();
+  const index = accounts.findIndex((account) => account.id === id);
+  if (index === -1) throw new Error(`账户不存在: ${id}`);
+  accounts[index].enabled = enabled;
+  accounts[index].updatedAt = Date.now();
+  const result = accounts[index];
+  accounts[index] = encryptAccount(result);
+  store().set('accounts', accounts);
+  return toSafeAccount(result);
 }
 
-export function setSourceSyncResult(
+export function setAccountSyncFolders(id: string, paths: string[]): SafeAccount {
+  const accounts = getAccounts();
+  const index = accounts.findIndex((account) => account.id === id);
+  if (index === -1) throw new Error(`账户不存在: ${id}`);
+  const unique = [...new Set(paths.filter((path) => path.length > 0))];
+  accounts[index].syncFolders = unique.length > 0 ? unique : ['INBOX'];
+  accounts[index].updatedAt = Date.now();
+  const result = accounts[index];
+  accounts[index] = encryptAccount(result);
+  store().set('accounts', accounts);
+  return toSafeAccount(result);
+}
+
+export function setAccountSyncResult(
   id: string,
   status: SyncStatus,
   error: string | null,
   at: number,
 ): void {
-  const sources = getSources();
-  const index = sources.findIndex((source) => source.id === id);
+  const accounts = getAccounts();
+  const index = accounts.findIndex((account) => account.id === id);
   if (index === -1) return;
-  sources[index].lastSyncAt = at;
-  sources[index].lastSyncStatus = status;
-  sources[index].lastSyncError = error;
-  sources[index] = encryptSource(sources[index]);
-  store().set('sources', sources);
+  accounts[index].lastSyncAt = at;
+  accounts[index].lastSyncStatus = status;
+  accounts[index].lastSyncError = error;
+  accounts[index] = encryptAccount(accounts[index]);
+  store().set('accounts', accounts);
 }
 
 /**
- * Persists refreshed OAuth tokens onto an existing source.
- *
- * Called just before a mailbox connection when the cached access token is
- * about to expire. Tokens go through the same encryption path as passwords —
- * a refresh token is a durable key to the user's mailbox.
+ * Persists refreshed OAuth tokens (and the granted scope set) onto an account.
+ * Tokens go through the same encryption path as passwords.
  */
-export function updateEmailTokens(
+export function updateAccountTokens(
   id: string,
-  tokens: { accessToken: string; refreshToken: string; expiresAt: number },
+  tokens: { accessToken: string; refreshToken: string; expiresAt: number; scopes?: string[] },
 ): void {
-  const sources = getSources();
-  const index = sources.findIndex((source) => source.id === id);
-  const target = index === -1 ? null : sources[index];
-  if (!target || !target.email) return;
-
-  target.email.accessToken = tokens.accessToken;
-  if (tokens.refreshToken) target.email.refreshToken = tokens.refreshToken;
-  target.email.accessTokenExpiresAt = tokens.expiresAt;
-
-  sources[index] = encryptSource(target);
-  store().set('sources', sources);
-}
-
-/* ----------------------------------------------------------------- messages */
-
-export function listMessages(filter?: MessageFilter): CaptchaMessage[] {
-  let list = store().get('messages');
-
-  if (filter) {
-    if (filter.kind && filter.kind !== 'all') {
-      list = list.filter((message) => message.sourceKind === filter.kind);
-    }
-    if (filter.sourceId && filter.sourceId !== 'all') {
-      list = list.filter((message) => message.sourceId === filter.sourceId);
-    }
-    if (filter.unreadOnly) {
-      list = list.filter((message) => !message.read);
-    }
-    if (filter.sinceMs && filter.sinceMs > 0) {
-      list = list.filter((message) => message.receivedAt >= filter.sinceMs!);
-    }
-    if (filter.search && filter.search.trim()) {
-      const query = filter.search.trim().toLowerCase();
-      list = list.filter(
-        (message) =>
-          message.code.toLowerCase().includes(query) ||
-          message.subject.toLowerCase().includes(query) ||
-          message.from.toLowerCase().includes(query) ||
-          message.summary.toLowerCase().includes(query) ||
-          message.sourceName.toLowerCase().includes(query),
-      );
-    }
-  }
-
-  list = sortByReceivedDesc(list);
-  if (filter?.limit && filter.limit > 0) {
-    list = list.slice(0, filter.limit);
-  }
-  return list;
-}
-
-export function addMessages(messages: CaptchaMessage[]): {
-  addedCount: number;
-  inserted: CaptchaMessage[];
-} {
-  const existing = store().get('messages');
-  const { merged, added } = mergeMessages(existing, messages);
-  if (added.length > 0) {
-    store().set('messages', capMessages(merged, MAX_MESSAGES));
-  }
-  return { addedCount: added.length, inserted: added };
-}
-
-export function setMessageRead(id: string, read: boolean): void {
-  const messages = store().get('messages');
-  const index = messages.findIndex((message) => message.id === id);
+  const accounts = getAccounts();
+  const index = accounts.findIndex((account) => account.id === id);
   if (index === -1) return;
-  messages[index].read = read;
-  store().set('messages', messages);
+  const target = accounts[index];
+  target.imap.accessToken = tokens.accessToken;
+  if (tokens.refreshToken) target.imap.refreshToken = tokens.refreshToken;
+  target.imap.accessTokenExpiresAt = tokens.expiresAt;
+  if (tokens.scopes && tokens.scopes.length > 0) target.scopes = tokens.scopes;
+  accounts[index] = encryptAccount(target);
+  store().set('accounts', accounts);
 }
 
-export function markAllMessagesRead(): void {
-  const messages = store().get('messages').map((message) => ({ ...message, read: true }));
-  store().set('messages', messages);
+export function setAccountNeedsReauth(id: string, needsReauth: boolean): void {
+  const accounts = getAccounts();
+  const index = accounts.findIndex((account) => account.id === id);
+  if (index === -1) return;
+  accounts[index].needsReauth = needsReauth;
+  accounts[index] = encryptAccount(accounts[index]);
+  store().set('accounts', accounts);
 }
 
-export function deleteMessage(id: string): void {
+/** Bulk write used by the migration path (plaintext secrets → encrypted). */
+export function replaceAccounts(accounts: Account[]): void {
+  store().set('accounts', accounts.map(encryptAccount));
+}
+
+/* ------------------------------------------------------------ totp entries */
+
+export function listTotpEntries(): TotpEntry[] {
+  return store().get('totpEntries').map(decryptTotpEntry);
+}
+
+export function listSafeTotpEntries(): SafeTotpEntry[] {
+  return listTotpEntries().map(toSafeTotpEntry);
+}
+
+export function getTotpEntry(id: string): TotpEntry | null {
+  return listTotpEntries().find((entry) => entry.id === id) ?? null;
+}
+
+function buildTotpEntry(input: TotpEntryInput, existing?: TotpEntry): TotpEntry {
+  const now = Date.now();
+  const previousSecret = existing?.totp.secret ?? '';
+  const merged = withTotpDefaults({ ...(existing?.totp ?? {}), ...(input.totp ?? {}) });
+  merged.secret = input.totp?.secret ? input.totp.secret : previousSecret;
+  return {
+    id: existing?.id ?? input.id ?? randomUUID(),
+    name: input.name.trim() || existing?.name || merged.issuer || merged.account || '未命名验证器',
+    enabled: input.enabled,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+    totp: merged,
+  };
+}
+
+export function createTotpEntry(input: TotpEntryInput): SafeTotpEntry {
+  const entries = listTotpEntries();
+  const created = buildTotpEntry(input);
+  entries.push(encryptTotpEntry(created));
+  store().set('totpEntries', entries);
+  return toSafeTotpEntry(created);
+}
+
+export function updateTotpEntry(id: string, input: TotpEntryInput): SafeTotpEntry {
+  const entries = listTotpEntries();
+  const index = entries.findIndex((entry) => entry.id === id);
+  if (index === -1) throw new Error(`验证器不存在: ${id}`);
+  const updated = buildTotpEntry({ ...input, id }, entries[index]);
+  entries[index] = encryptTotpEntry(updated);
+  store().set('totpEntries', entries);
+  return toSafeTotpEntry(updated);
+}
+
+export function deleteTotpEntry(id: string): void {
   store().set(
-    'messages',
-    store()
-      .get('messages')
-      .filter((message) => message.id !== id),
+    'totpEntries',
+    listTotpEntries().filter((entry) => entry.id !== id),
   );
 }
 
-export function clearMessages(): void {
-  store().set('messages', []);
-}
-
-/* ----------------------------------------------------------------- settings */
-
-export function getSettings(): AppSettings {
-  return { ...DEFAULT_SETTINGS, ...store().get('settings') };
-}
-
-export function updateSettings(patch: Partial<AppSettings>): AppSettings {
-  const merged: AppSettings = { ...getSettings(), ...patch };
-  merged.pollIntervalSec = Math.min(600, Math.max(15, Math.round(merged.pollIntervalSec)));
-  merged.theme = merged.theme === 'light' ? 'light' : 'dark';
-  store().set('settings', merged);
-  return merged;
-}
-
-/* ------------------------------------------------------- backup / teardown */
-
-export function exportBackup(includeSecrets: boolean): BackupBundle {
-  const sources = getSources();
-
-  const bundle: BackupBundle = {
-    version: 1,
-    exportedAt: Date.now(),
-    includeSecrets,
-    // Email passwords are NEVER exported in plaintext — the user re-enters them
-    // after a restore. Only TOTP secrets are optionally included (explicit ask).
-    sources: sources.map(toSafeSource),
-    messages: store().get('messages'),
-    settings: getSettings(),
-  };
-
-  if (includeSecrets) {
-    bundle.totpSecrets = sources
-      .filter((source) => source.kind === 'totp' && source.totp)
-      .map((source) => ({
-        name: source.name,
-        issuer: source.totp!.issuer,
-        account: source.totp!.account,
-        algorithm: source.totp!.algorithm,
-        digits: source.totp!.digits,
-        period: source.totp!.period,
-        secret: source.totp!.secret,
-      }));
-  }
-
-  return bundle;
-}
-
-export function importBackup(bundle: BackupBundle): void {
-  if (!bundle || bundle.version !== 1) {
-    throw new Error('不支持的备份文件版本');
-  }
-
-  // Import plaintext sources (secrets optional) direct into storage.
-  const sources = getSources();
-  const existingIds = new Set(sources.map((source) => source.id));
-
-  for (const safe of bundle.sources ?? []) {
-    const source: Source = {
-      id: safe.id && !existingIds.has(safe.id) ? safe.id : randomUUID(),
-      kind: safe.kind,
-      name: safe.name,
-      enabled: safe.enabled,
-      createdAt: safe.createdAt || Date.now(),
-      updatedAt: Date.now(),
-      lastSyncAt: safe.lastSyncAt ?? null,
-      lastSyncStatus: 'never',
-      lastSyncError: null,
-      email: safe.email
-        ? {
-            host: safe.email.host,
-            port: safe.email.port,
-            secure: safe.email.secure,
-            username: safe.email.username,
-            password: '',
-            mailbox: safe.email.mailbox,
-            authType: safe.email.authType ?? 'password',
-            clientId: safe.email.clientId ?? '',
-            tenant: safe.email.tenant ?? MS_DEFAULT_TENANT,
-            // Tokens are never exported, so a restored OAuth source must be
-            // re-authorised once before it can sync again.
-            refreshToken: '',
-            accessToken: '',
-            accessTokenExpiresAt: 0,
-          }
-        : null,
-      phone: safe.phone ?? null,
-      totp: safe.totp ? withTotpDefaults(safe.totp) : null,
-    };
-    sources.push(encryptSource(source));
-    existingIds.add(source.id);
-  }
-  store().set('sources', sources);
-
-  if (Array.isArray(bundle.messages)) {
-    addMessages(bundle.messages);
-  }
-  if (Array.isArray(bundle.totpSecrets) && bundle.totpSecrets.length > 0) {
-    importTotp(bundle.totpSecrets);
-  }
-  if (bundle.settings) {
-    updateSettings(bundle.settings);
-  }
-}
-
-export function clearAll(): void {
-  store().set('sources', []);
-  store().set('messages', []);
-  store().set('settings', DEFAULT_SETTINGS);
+export function replaceTotpEntries(entries: TotpEntry[]): void {
+  store().set('totpEntries', entries.map(encryptTotpEntry));
 }
 
 /** Export all TOTP secrets (optionally masked) for a user-initiated backup. */
 export function exportTotp(includeSecrets: boolean): TotpExportItem[] {
-  return getSources()
-    .filter((source) => source.kind === 'totp' && source.totp)
-    .map((source) => ({
-      name: source.name,
-      issuer: source.totp!.issuer,
-      account: source.totp!.account,
-      algorithm: source.totp!.algorithm,
-      digits: source.totp!.digits,
-      period: source.totp!.period,
-      secret: includeSecrets ? source.totp!.secret : '',
-    }));
+  return listTotpEntries().map((entry) => ({
+    name: entry.name,
+    issuer: entry.totp.issuer,
+    account: entry.totp.account,
+    algorithm: entry.totp.algorithm,
+    digits: entry.totp.digits,
+    period: entry.totp.period,
+    secret: includeSecrets ? entry.totp.secret : '',
+  }));
 }
 
-/** Bulk-import TOTP entries as new sources. */
-export function importTotp(items: TotpExportItem[]): SafeSource[] {
-  const created: SafeSource[] = [];
+/** Bulk-import TOTP entries. */
+export function importTotp(items: TotpExportItem[]): SafeTotpEntry[] {
+  const created: SafeTotpEntry[] = [];
   for (const item of items) {
     if (!item || !item.secret) continue;
     created.push(
-      createSource({
-        kind: 'totp',
+      createTotpEntry({
         name: item.name || item.issuer || item.account || '导入的验证器',
         enabled: true,
         totp: {
@@ -532,4 +452,107 @@ export function importTotp(items: TotpExportItem[]): SafeSource[] {
     );
   }
   return created;
+}
+
+/* ---------------------------------------------------------------- settings */
+
+export function getSettings(): AppSettings {
+  return mergeSettings(store().get('settings'), undefined);
+}
+
+export function updateSettings(patch: Partial<AppSettings>): AppSettings {
+  const merged = mergeSettings(store().get('settings'), patch);
+  store().set('settings', merged);
+  return merged;
+}
+
+/* ------------------------------------------------------- backup / teardown */
+
+export function exportBackup(includeSecrets: boolean): BackupBundle {
+  const accounts = getAccounts();
+  const bundle: BackupBundle = {
+    version: 2,
+    exportedAt: Date.now(),
+    includeSecrets,
+    // Mail passwords / OAuth tokens are NEVER exported in plaintext — the user
+    // re-enters them after a restore. Only TOTP secrets are optionally included.
+    accounts: accounts.map(toSafeAccount),
+    envelopes: [],
+    drafts: [],
+    settings: getSettings(),
+  };
+
+  if (includeSecrets) {
+    bundle.totpSecrets = exportTotp(true);
+  }
+  return bundle;
+}
+
+export function importBackup(bundle: BackupBundle): void {
+  if (!bundle || bundle.version !== 2) {
+    throw new Error('不支持的备份文件版本（需要 Mail Hub v2 备份）');
+  }
+
+  const accounts = getAccounts();
+  const existingIds = new Set(accounts.map((account) => account.id));
+
+  for (const safe of bundle.accounts ?? []) {
+    const account: Account = {
+      id: safe.id && !existingIds.has(safe.id) ? safe.id : randomUUID(),
+      name: safe.name,
+      enabled: safe.enabled,
+      emailAddress: safe.emailAddress,
+      displayName: safe.displayName ?? '',
+      imap: {
+        host: safe.imap.host,
+        port: safe.imap.port,
+        secure: safe.imap.secure,
+        username: safe.imap.username,
+        password: '',
+        authType: safe.imap.authType ?? 'password',
+        clientId: safe.imap.clientId ?? '',
+        tenant: safe.imap.tenant ?? MS_DEFAULT_TENANT,
+        // Tokens are never exported, so a restored OAuth account must be
+        // re-authorised once before it can sync again.
+        refreshToken: '',
+        accessToken: '',
+        accessTokenExpiresAt: 0,
+      },
+      smtp: safe.smtp
+        ? {
+            host: safe.smtp.host,
+            port: safe.smtp.port,
+            secure: safe.smtp.secure,
+            username: safe.smtp.username,
+            password: '',
+            authType: safe.smtp.authType ?? 'password',
+          }
+        : null,
+      syncFolders: safe.syncFolders ?? ['INBOX'],
+      signature: safe.signature ?? '',
+      scopes: [],
+      needsReauth: false,
+      createdAt: safe.createdAt || Date.now(),
+      updatedAt: Date.now(),
+      lastSyncAt: safe.lastSyncAt ?? null,
+      lastSyncStatus: 'never',
+      lastSyncError: null,
+    };
+    accounts.push(encryptAccount(account));
+    existingIds.add(account.id);
+  }
+  store().set('accounts', accounts);
+
+  if (Array.isArray(bundle.totpSecrets) && bundle.totpSecrets.length > 0) {
+    importTotp(bundle.totpSecrets);
+  }
+  if (bundle.settings) {
+    updateSettings(bundle.settings);
+  }
+}
+
+export function clearAll(): void {
+  store().set('accounts', []);
+  store().set('totpEntries', []);
+  store().set('settings', { ...DEFAULT_SETTINGS, migratedFromV1: true });
 }

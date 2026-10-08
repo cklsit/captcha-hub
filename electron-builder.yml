@@ -1,6 +1,6 @@
-appId: com.captchahub.desktop
-productName: Captcha Hub
-copyright: Copyright © 2024 Captcha Hub
+appId: com.mailhub.desktop
+productName: Mail Hub
+copyright: Copyright © 2024 Mail Hub
 directories:
   output: release
   buildResources: build
@@ -20,4 +20,4 @@ nsis:
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
-  shortcutName: Captcha Hub
+  shortcutName: Mail Hub
